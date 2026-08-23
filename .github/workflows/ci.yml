@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libepoxy-dev \
+            libgl1-mesa-dev libegl1 libegl-mesa0 libgl1-mesa-dri \
+            xvfb x11-utils xdotool imagemagick
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        # LIBGL_ALWAYS_SOFTWARE makes the GPU render tests run on llvmpipe, so
+        # they execute on a runner with no graphics hardware instead of skipping.
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Shader self-check
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: ./target/release/pixelmagic --check-shaders
+
+      - name: Smoke test
+        run: ./scripts/smoke-test.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-screenshots
+          path: /tmp/pixelmagic-smoke/*.png
+          if-no-files-found: ignore

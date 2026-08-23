@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Pixelmagic
+GenericName=Image Editor
+Comment=GPU-accelerated, non-destructive image editing
+Exec=pixelmagic %F
+Icon=dev.pixelmagic.Pixelmagic
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;GTK;
+MimeType=image/png;image/jpeg;image/tiff;image/webp;image/bmp;image/gif;application/x-pixelmagic;
+Keywords=image;editor;photo;paint;layers;
+StartupNotify=true

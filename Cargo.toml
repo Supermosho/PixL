@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pixelmagic-core",
+    "crates/pixelmagic-gpu",
+    "crates/pixelmagic-io",
+    "crates/pixelmagic-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Supermosho/Pixelmagic"
+authors = ["Pixelmagic contributors"]
+
+[workspace.dependencies]
+pixelmagic-core = { path = "crates/pixelmagic-core" }
+pixelmagic-gpu = { path = "crates/pixelmagic-gpu" }
+pixelmagic-io = { path = "crates/pixelmagic-io" }
+
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+glib = "0.21"
+gdk = { package = "gdk4", version = "0.11" }
+glow = "0.18"
+
+glam = { version = "0.30", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "webp", "bmp", "gif"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+slotmap = { version = "1", features = ["serde"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

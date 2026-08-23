@@ -1,0 +1,25 @@
+[package]
+name = "pixelmagic-app"
+description = "GTK4 front end for Pixelmagic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pixelmagic"
+path = "src/main.rs"
+
+[dependencies]
+pixelmagic-core.workspace = true
+pixelmagic-gpu.workspace = true
+pixelmagic-io.workspace = true
+gtk.workspace = true
+adw.workspace = true
+gdk.workspace = true
+glow.workspace = true
+glam.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true

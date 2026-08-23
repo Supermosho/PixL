@@ -1,0 +1,19 @@
+[package]
+name = "pixelmagic-core"
+description = "Document model, layer graph, colour and history for Pixelmagic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+slotmap.workspace = true
+rayon.workspace = true
