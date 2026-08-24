@@ -640,6 +640,101 @@ fn kind_glyph(kind: &LayerKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Histogram
+// ---------------------------------------------------------------------------
+
+/// The histogram that sits at the top of the Color Adjustments pane
+/// (`docs/SPEC.md` §3.1).
+///
+/// Drawn as three additively-blended channel fills, which is the conventional
+/// look and is genuinely informative: where all three overlap you get white,
+/// so neutral tones read as grey and a colour cast shows up as a coloured
+/// fringe. A single luma curve would hide exactly the thing you open a
+/// histogram to see.
+pub fn build_histogram(hist: Option<pixelmagic_gpu::renderer::Histogram>) -> gtk::DrawingArea {
+    use pixelmagic_gpu::renderer::Histogram;
+
+    let area = gtk::DrawingArea::new();
+    area.set_content_height(96);
+    area.set_hexpand(true);
+    area.add_css_class("histogram");
+
+    area.set_draw_func(move |_, cr, w, h| {
+        let (w, h) = (w as f64, h as f64);
+
+        cr.set_source_rgb(0.11, 0.11, 0.12);
+        let _ = cr.paint();
+
+        // Quarter-tone guides, so the eye can place shadows and highlights.
+        cr.set_line_width(1.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
+        for i in 1..4 {
+            let x = (w * i as f64 / 4.0).floor() + 0.5;
+            cr.move_to(x, 0.0);
+            cr.line_to(x, h);
+        }
+        let _ = cr.stroke();
+
+        let Some(hist) = hist.as_ref() else {
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+            cr.move_to(8.0, h / 2.0);
+            let _ = cr.show_text("No histogram yet");
+            return;
+        };
+        if hist.is_empty() {
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+            cr.move_to(8.0, h / 2.0);
+            let _ = cr.show_text("Empty document");
+            return;
+        }
+
+        // Scaling to the tallest bin is the obvious choice and the wrong one.
+        // A single flat region — a solid background, a clipped highlight, a
+        // channel that only takes two values — produces a spike orders of
+        // magnitude above everything else, and dividing by it flattens the
+        // actual distribution into an invisible smear along the bottom.
+        //
+        // So: sort every bin across the three channels and scale to roughly the
+        // 98th percentile, letting the handful of spikes clip off the top. The
+        // shape of the distribution is what a histogram is read for; the exact
+        // height of a spike is not.
+        let mut sorted: Vec<u32> = [Histogram::RED, Histogram::GREEN, Histogram::BLUE]
+            .iter()
+            .flat_map(|c| hist.bins[*c].iter().copied())
+            .filter(|v| *v > 0)
+            .collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let ceiling = sorted
+            .get(sorted.len() / 50)
+            .copied()
+            .or_else(|| sorted.first().copied())
+            .unwrap_or(1)
+            .max(1) as f64;
+
+        cr.set_operator(gtk::cairo::Operator::Add);
+        for (channel, rgb) in [
+            (Histogram::RED, (0.90, 0.20, 0.20)),
+            (Histogram::GREEN, (0.20, 0.85, 0.30)),
+            (Histogram::BLUE, (0.25, 0.45, 0.95)),
+        ] {
+            cr.move_to(0.0, h);
+            for bin in 0..256 {
+                let x = w * bin as f64 / 255.0;
+                let v = (hist.bins[channel][bin] as f64 / ceiling).min(1.0);
+                cr.line_to(x, h - v * (h - 2.0));
+            }
+            cr.line_to(w, h);
+            cr.close_path();
+            cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.55);
+            let _ = cr.fill();
+        }
+        cr.set_operator(gtk::cairo::Operator::Over);
+    });
+
+    area
+}
+
+// ---------------------------------------------------------------------------
 // Adjustments and effects panels
 // ---------------------------------------------------------------------------
 
@@ -648,6 +743,7 @@ fn kind_glyph(kind: &LayerKind) -> &'static str {
 pub fn build_adjustments_panel(
     state: Rc<RefCell<EditorState>>,
     on_change: Rc<dyn Fn()>,
+    histogram: Option<pixelmagic_gpu::renderer::Histogram>,
 ) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
     outer.set_margin_top(8);
@@ -659,6 +755,16 @@ pub fn build_adjustments_panel(
     heading.add_css_class("title-4");
     heading.set_xalign(0.0);
     outer.append(&heading);
+
+    let pixels = histogram.as_ref().map(|h| h.total).unwrap_or(0);
+    outer.append(&build_histogram(histogram));
+    if pixels > 0 {
+        let caption = gtk::Label::new(Some(&format!("{pixels} px")));
+        caption.add_css_class("dim-label");
+        caption.add_css_class("caption");
+        caption.set_xalign(1.0);
+        outer.append(&caption);
+    }
 
     for kind in AdjustmentKind::ALL {
         let expander = gtk::Expander::new(Some(kind.label()));

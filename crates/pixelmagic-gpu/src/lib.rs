@@ -26,11 +26,13 @@
 //! - Passes never read and write the same target; the [`TargetPool`] supplies
 //!   ping-pong buffers.
 
+pub mod compute;
 pub mod headless;
 pub mod program;
 pub mod renderer;
 pub mod texture;
 
+pub use compute::{Capabilities, ComputeLibrary, ComputeProgram, StorageBuffer};
 pub use program::{GlFlavor, Program, ShaderLibrary};
 pub use renderer::{FrameStats, Renderer};
 pub use texture::{Filter, Format, RenderTarget, TargetPool, Texture, Wrap};

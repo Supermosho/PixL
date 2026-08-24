@@ -493,12 +493,31 @@ impl Canvas {
         let (w, h) = (st.document.width, st.document.height);
         drop(st);
 
-        let pixels = target.read_srgb8_straight().map_err(|e| e.to_string());
+        let pixels = gl.renderer.read_image(&target).map_err(|e| e.to_string());
         gl.renderer.release(target);
         let pixels = pixels?;
 
         PixelBuffer::from_raw(w, h, pixels)
             .ok_or_else(|| "readback produced the wrong number of bytes".to_string())
+    }
+
+    /// Render the document and compute its histogram.
+    ///
+    /// Returns `None` before the GLArea has been realised — the Color
+    /// Adjustments panel is built during window construction, which happens
+    /// before there is any GL context to render with.
+    pub fn histogram(&self) -> Option<pixelmagic_gpu::renderer::Histogram> {
+        self.widget.make_current();
+        let mut gl_ref = self.gl.borrow_mut();
+        let gl = gl_ref.as_mut()?;
+
+        let st = self.state.borrow();
+        let target = gl.renderer.render_document(&st.document, &st.revisions).ok()?;
+        drop(st);
+
+        let hist = gl.renderer.histogram(&target).ok();
+        gl.renderer.release(target);
+        hist
     }
 
     /// Fit the document to the widget — `Command-0`.

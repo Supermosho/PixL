@@ -32,6 +32,7 @@ use pixelmagic_core::param::ParamValue;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::compute::{Capabilities, ComputeLibrary, StorageBuffer};
 use crate::program::{GlFlavor, ShaderLibrary};
 use crate::texture::{Filter, Format, RenderTarget, TargetPool, Texture, Wrap};
 use crate::{GpuError, Result};
@@ -51,11 +52,55 @@ pub struct FrameStats {
     pub layers_skipped: usize,
     pub passes: usize,
     pub uploads: usize,
+    /// Compute dispatches, as opposed to fragment passes.
+    pub dispatches: usize,
+}
+
+/// A 256-bin histogram of the composited image.
+///
+/// Channels are red, green, blue and luminance, binned on **encoded** sRGB
+/// values — the space a histogram is read in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Histogram {
+    pub bins: [[u32; 256]; 4],
+    /// Non-transparent pixels counted.
+    pub total: u32,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self { bins: [[0; 256]; 4], total: 0 }
+    }
+}
+
+impl Histogram {
+    pub const RED: usize = 0;
+    pub const GREEN: usize = 1;
+    pub const BLUE: usize = 2;
+    pub const LUMA: usize = 3;
+
+    /// Largest bin across a channel, for scaling the plot.
+    pub fn peak(&self, channel: usize) -> u32 {
+        self.bins.get(channel).map(|b| b.iter().copied().max().unwrap_or(0)).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
 }
 
 pub struct Renderer {
     gl: Rc<glow::Context>,
     shaders: ShaderLibrary,
+    compute: ComputeLibrary,
+    caps: Capabilities,
+    /// What the driver reported at start-up, so the test toggle can restore it.
+    caps_detected: Capabilities,
+    /// Blur radius at or above which the compute path is used. See
+    /// [`Renderer::compute_blur_min_radius`].
+    compute_blur_min_radius: f32,
+    /// 4 × 256 `u32` bins, reused between histogram queries.
+    histogram_buffer: Option<StorageBuffer>,
     pool: TargetPool,
     vao: glow::VertexArray,
     layer_cache: HashMap<LayerId, LayerCache>,
@@ -75,8 +120,15 @@ impl Renderer {
     pub fn new(gl: Rc<glow::Context>, flavor: GlFlavor) -> Result<Self> {
         use glow::HasContext;
         let vao = unsafe { gl.create_vertex_array().map_err(GpuError::Gl)? };
+        let caps = Capabilities::detect(&gl, flavor);
+        log::info!("renderer capabilities: {}", caps.describe());
         let mut r = Self {
             shaders: ShaderLibrary::new(gl.clone(), flavor),
+            compute: ComputeLibrary::new(gl.clone(), flavor),
+            caps,
+            caps_detected: caps,
+            compute_blur_min_radius: default_compute_blur_min_radius(),
+            histogram_buffer: None,
             pool: TargetPool::new(gl.clone()),
             vao,
             layer_cache: HashMap::new(),
@@ -120,7 +172,48 @@ impl Renderer {
     /// rejects one of them says so immediately instead of when the user
     /// reaches for that effect.
     pub fn precompile(&mut self) -> Result<usize> {
-        self.shaders.compile_all()
+        let fragment = self.shaders.compile_all()?;
+        let compute = if self.caps.compute { self.compute.compile_all()? } else { 0 };
+        Ok(fragment + compute)
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        self.caps
+    }
+
+    /// Force the fragment fallback even where compute is available.
+    ///
+    /// Exists so the test suite can render the same scene both ways and assert
+    /// they agree, which is the only way to keep the two implementations from
+    /// drifting apart.
+    pub fn set_compute_enabled(&mut self, enabled: bool) {
+        self.caps.compute = enabled && self.caps_detected.compute;
+    }
+
+    /// Radius at or above which a blur is dispatched as a compute shader.
+    ///
+    /// Compute is not unconditionally faster. A dispatch has fixed overhead —
+    /// pipeline switch, barrier, image binding — while the shared-memory saving
+    /// grows with radius, so below some crossover the fragment path wins.
+    /// Measured on llvmpipe (`examples/bench.rs`), 1024², gaussian:
+    ///
+    /// | radius | fragment | compute | ratio |
+    /// |-------:|---------:|--------:|------:|
+    /// |      8 |   370 ms |  486 ms | 0.76× |
+    /// |     24 |   670 ms |  625 ms | 1.07× |
+    /// |     48 |  1110 ms |  747 ms | 1.49× |
+    ///
+    /// A software rasteriser is the pessimistic case — it has no on-die
+    /// scratchpad, so shared memory buys nothing there and the crossover sits
+    /// high. Real hardware should cross over lower. The default of 12 is a
+    /// deliberately conservative middle; `PIXELMAGIC_COMPUTE_BLUR_MIN`
+    /// overrides it for anyone who benchmarks their own GPU.
+    pub fn compute_blur_min_radius(&self) -> f32 {
+        self.compute_blur_min_radius
+    }
+
+    pub fn set_compute_blur_min_radius(&mut self, radius: f32) {
+        self.compute_blur_min_radius = radius.max(0.0);
     }
 
     /// Drop cached textures for layers that no longer exist.
@@ -1020,6 +1113,66 @@ impl Renderer {
         radius: f32,
         kernel: i32,
     ) -> Result<RenderTarget> {
+        if self.caps.compute && radius >= self.compute_blur_min_radius {
+            return self.blur_kernel_compute(src, radius, kernel);
+        }
+        self.blur_kernel_fragment(src, radius, kernel)
+    }
+
+    /// Shared-memory blur. Both axes are still separate passes — that is what
+    /// makes a blur O(r) instead of O(r²) — but each pass now reads the image
+    /// once into shared memory instead of once per tap.
+    fn blur_kernel_compute(
+        &mut self,
+        src: &RenderTarget,
+        radius: f32,
+        kernel: i32,
+    ) -> Result<RenderTarget> {
+        let (w, h) = (src.width(), src.height());
+        let tmp = self.pool.acquire(w, h, Format::Rgba16f)?;
+        let out = self.pool.acquire(w, h, Format::Rgba16f)?;
+
+        // Horizontal: workgroups tile along x, one row of groups per image row.
+        {
+            let (s_tex, d_tex) = (src.texture.handle(), tmp.texture.handle());
+            let p = self.compute.get("blur_separable")?;
+            p.bind();
+            p.set_texture("u_src", 0, s_tex);
+            p.bind_image(0, d_tex, glow::RGBA16F, true);
+            p.set_ivec2("u_size", [w as i32, h as i32]);
+            p.set_ivec2("u_direction", [1, 0]);
+            p.set_f32("u_radius", radius);
+            p.set_i32("u_kernel", kernel);
+            p.dispatch_covering(w, h, (128, 1));
+            p.barrier_image_to_texture();
+        }
+
+        // Vertical: the roles of the two dispatch axes swap.
+        {
+            let (s_tex, d_tex) = (tmp.texture.handle(), out.texture.handle());
+            let p = self.compute.get("blur_separable")?;
+            p.bind();
+            p.set_texture("u_src", 0, s_tex);
+            p.bind_image(0, d_tex, glow::RGBA16F, true);
+            p.set_ivec2("u_size", [w as i32, h as i32]);
+            p.set_ivec2("u_direction", [0, 1]);
+            p.set_f32("u_radius", radius);
+            p.set_i32("u_kernel", kernel);
+            p.dispatch_covering(h, w, (128, 1));
+            p.barrier_image_to_texture();
+        }
+
+        self.stats.dispatches += 2;
+        self.pool.release(tmp);
+        Ok(out)
+    }
+
+    fn blur_kernel_fragment(
+        &mut self,
+        src: &RenderTarget,
+        radius: f32,
+        kernel: i32,
+    ) -> Result<RenderTarget> {
         let (w, h) = (src.width(), src.height());
         let texel = [1.0 / w as f32, 1.0 / h as f32];
 
@@ -1115,6 +1268,94 @@ impl Renderer {
             .upload_raw(&data)
     }
 
+    /// Read a rendered target back as straight-alpha sRGB8.
+    ///
+    /// Goes through a shader encode pass into an 8-bit target and reads that,
+    /// rather than asking for floats directly. See `encode_srgb.frag` for why:
+    /// float ReadPixels is not portable to GLES, and this is.
+    pub fn read_image(&mut self, image: &RenderTarget) -> Result<Vec<u8>> {
+        let (w, h) = (image.width(), image.height());
+        let encoded = self.pool.acquire(w, h, Format::Rgba8)?;
+        encoded.bind();
+
+        let handle = image.texture.handle();
+        let p = self.shaders.get("encode_srgb")?;
+        p.bind();
+        p.set_texture("u_image", 0, handle);
+        self.draw_quad();
+        self.stats.passes += 1;
+
+        let bytes = encoded.read_rgba8();
+        self.pool.release(encoded);
+        bytes
+    }
+
+    /// Compute a 256-bin histogram of a rendered target.
+    ///
+    /// Uses a compute shader with per-workgroup shared bins where available.
+    /// The CPU fallback reads the frame back and bins it in software: slower by
+    /// a wide margin, but it means the Levels and Curves panes still show a
+    /// histogram on a driver without compute rather than showing nothing.
+    pub fn histogram(&mut self, image: &RenderTarget) -> Result<Histogram> {
+        if self.caps.compute {
+            self.histogram_compute(image)
+        } else {
+            self.histogram_cpu(image)
+        }
+    }
+
+    fn histogram_compute(&mut self, image: &RenderTarget) -> Result<Histogram> {
+        const BINS: usize = 256 * 4;
+        if self.histogram_buffer.is_none() {
+            self.histogram_buffer = Some(StorageBuffer::new(self.gl.clone(), BINS * 4)?);
+        }
+        let buffer = self.histogram_buffer.as_ref().expect("just created");
+        buffer.clear_to_zero();
+        buffer.bind(0);
+
+        let (w, h) = (image.width(), image.height());
+        let tex = image.texture.handle();
+        {
+            let p = self.compute.get("histogram")?;
+            p.bind();
+            p.set_texture("u_src", 0, tex);
+            p.set_ivec2("u_size", [w as i32, h as i32]);
+            p.dispatch_covering(w, h, (16, 16));
+            p.barrier_storage();
+        }
+        self.stats.dispatches += 1;
+
+        let raw = self.histogram_buffer.as_ref().expect("just created").read_u32();
+
+        let mut hist = Histogram::default();
+        for channel in 0..4 {
+            for bin in 0..256 {
+                hist.bins[channel][bin] = raw.get(channel * 256 + bin).copied().unwrap_or(0);
+            }
+        }
+        // Every counted pixel contributes exactly once to each channel, so any
+        // one channel's sum is the pixel count.
+        hist.total = hist.bins[Histogram::LUMA].iter().sum();
+        Ok(hist)
+    }
+
+    fn histogram_cpu(&mut self, image: &RenderTarget) -> Result<Histogram> {
+        let pixels = self.read_image(image)?;
+        let mut hist = Histogram::default();
+        for px in pixels.chunks_exact(4) {
+            if px[3] == 0 {
+                continue;
+            }
+            hist.bins[Histogram::RED][px[0] as usize] += 1;
+            hist.bins[Histogram::GREEN][px[1] as usize] += 1;
+            hist.bins[Histogram::BLUE][px[2] as usize] += 1;
+            let luma = 0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
+            hist.bins[Histogram::LUMA][(luma.round() as usize).min(255)] += 1;
+            hist.total += 1;
+        }
+        Ok(hist)
+    }
+
     /// Draw a finished document target to a framebuffer.
     ///
     /// `target` is `None` for the window's default framebuffer. It matters that
@@ -1169,6 +1410,16 @@ impl Drop for Renderer {
         use glow::HasContext;
         unsafe { self.gl.delete_vertex_array(self.vao) };
     }
+}
+
+/// Default crossover radius for the compute blur, overridable by environment
+/// variable so a user can tune it to their own hardware without a rebuild.
+fn default_compute_blur_min_radius() -> f32 {
+    std::env::var("PIXELMAGIC_COMPUTE_BLUR_MIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(12.0)
 }
 
 /// Aspect correction so radial effects stay circular on non-square canvases.

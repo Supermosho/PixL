@@ -34,6 +34,10 @@ const CSS: &str = "
 .param-row {
     margin: 2px 0;
 }
+.histogram {
+    border-radius: 6px;
+    margin: 4px 0;
+}
 ";
 
 fn main() -> glib::ExitCode {
@@ -134,11 +138,14 @@ fn check_shaders() -> glib::ExitCode {
     match pixelmagic_gpu::headless::HeadlessContext::new() {
         Ok(ctx) => {
             println!("GL context: {}", ctx.describe());
+            if let Ok(r) = pixelmagic_gpu::Renderer::new(ctx.gl.clone(), ctx.flavor) {
+                println!("capabilities: {}", r.capabilities().describe());
+            }
             match pixelmagic_gpu::Renderer::new(ctx.gl.clone(), ctx.flavor)
                 .and_then(|mut r| r.precompile())
             {
                 Ok(n) => {
-                    println!("all {n} shaders compiled");
+                    println!("all {n} shaders compiled (fragment + compute)");
                     glib::ExitCode::SUCCESS
                 }
                 Err(e) => {

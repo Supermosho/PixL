@@ -77,6 +77,10 @@ shot() { sleep 2; import -window root "$OUT/$1.png" 2>/dev/null; echo "  capture
 shot 01-open
 
 echo "== tool shortcuts and panels =="
+# The Color Adjustments pane computes a histogram, which is the only thing in
+# the app that uses a compute shader and a storage-buffer readback. It is
+# therefore the step that exercises the GL/GLES entry points the headless tests
+# (desktop GL only) cannot reach.
 xdotool key --window "$WID" a; shot 02-adjustments
 xdotool key --window "$WID" f; shot 03-effects
 xdotool key --window "$WID" b; shot 04-paint-tool
@@ -112,6 +116,15 @@ grep -vE 'dbus|Gtk-WARNING|^$' "$OUT/app.log" | head -20
 
 if grep -qiE 'panicked|SIGSEGV|Segmentation' "$OUT/app.log"; then
     echo "FAIL: the app reported a crash"
+    exit 1
+fi
+
+# libepoxy aborts rather than returning an error when a GL entry point is
+# missing from the current context — the failure mode for calling a desktop-only
+# function on a GLES context. It prints this first, so catch it by name.
+if grep -qiE 'No provider of' "$OUT/app.log"; then
+    echo "FAIL: the app called a GL entry point this context does not have"
+    grep -A3 -i 'No provider of' "$OUT/app.log"
     exit 1
 fi
 

@@ -19,12 +19,13 @@ use crate::{GpuError, Result};
 // module has no build-time dependency on EGL headers being installed.
 const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
 const EGL_OPENGL_API: u32 = 0x30A2;
+const EGL_OPENGL_ES_API: u32 = 0x30A0;
+const EGL_OPENGL_ES3_BIT: i32 = 0x00000040;
 const EGL_NO_DISPLAY: *mut c_void = std::ptr::null_mut();
 const EGL_NO_CONTEXT: *mut c_void = std::ptr::null_mut();
 const EGL_NO_SURFACE: *mut c_void = std::ptr::null_mut();
 
 const EGL_SURFACE_TYPE: i32 = 0x3033;
-const EGL_PBUFFER_BIT: i32 = 0x0001;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_BIT: i32 = 0x0008;
 const EGL_RED_SIZE: i32 = 0x3024;
@@ -50,6 +51,7 @@ type EglCreateContext =
 type EglMakeCurrent =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u32;
 type EglTerminate = unsafe extern "C" fn(*mut c_void) -> u32;
+type EglGetError = unsafe extern "C" fn() -> i32;
 type EglDestroyContext = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
 
 /// An owned headless GL context. Dropping it tears the context down.
@@ -62,12 +64,49 @@ pub struct HeadlessContext {
 }
 
 impl HeadlessContext {
-    /// Bring up a surfaceless OpenGL 3.3 core context.
+    /// Bring up a surfaceless context.
+    ///
+    /// Desktop GL 3.3 core by default. `PIXELMAGIC_TEST_GLES=1` asks for GLES
+    /// instead, which matters because GLES is what the application actually
+    /// runs on: GTK hands `GtkGLArea` a GLES context on a great many systems,
+    /// and a suite that only exercises desktop GL passes happily while the app
+    /// aborts on a desktop-only entry point. That is not hypothetical — it is
+    /// how `glGetBufferSubData` got into the histogram readback.
+    ///
+    /// **Caveat:** the GLES path does not currently come up on Mesa's software
+    /// rasteriser (`eglCreateContext` returns `EGL_BAD_ATTRIBUTE` regardless of
+    /// the config chosen), so it is unverified there. Real GLES coverage comes
+    /// from `scripts/smoke-test.sh`, which drives the actual application
+    /// against the context GTK creates. If you are on hardware where this
+    /// works, running the suite both ways is worth it.
     ///
     /// Returns [`GpuError::NoContext`] rather than panicking when EGL is
     /// missing, so tests can skip cleanly on machines without it instead of
     /// reporting a spurious failure.
     pub fn new() -> Result<Self> {
+        let want_es = std::env::var("PIXELMAGIC_TEST_GLES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        Self::with_api(want_es)
+    }
+
+    pub fn new_desktop() -> Result<Self> {
+        Self::with_api(false)
+    }
+
+    pub fn new_es() -> Result<Self> {
+        Self::with_api(true)
+    }
+
+    fn with_api(want_es: bool) -> Result<Self> {
+        // Serialise context creation. `eglBindAPI` is per-thread but the
+        // display and its config list are shared, and bringing up thirty
+        // contexts concurrently — which is exactly what a parallel test run
+        // does — makes Mesa intermittently return EGL_BAD_ATTRIBUTE. Creation
+        // happens a handful of times per process, so a mutex costs nothing.
+        static EGL_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = EGL_INIT.lock().unwrap_or_else(|e| e.into_inner());
+
         unsafe {
             let lib = libloading::Library::new("libEGL.so.1")
                 .or_else(|_| libloading::Library::new("libEGL.so"))
@@ -104,18 +143,29 @@ impl HeadlessContext {
 
             let bind_api: libloading::Symbol<EglBindApi> =
                 lib.get(b"eglBindAPI\0").map_err(|e| GpuError::NoContext(e.to_string()))?;
-            if bind_api(EGL_OPENGL_API) == 0 {
-                return Err(GpuError::NoContext("this EGL has no desktop GL".into()));
+            let api = if want_es { EGL_OPENGL_ES_API } else { EGL_OPENGL_API };
+            if bind_api(api) == 0 {
+                return Err(GpuError::NoContext(format!(
+                    "this EGL cannot bind {}",
+                    if want_es { "GLES" } else { "desktop GL" }
+                )));
             }
 
             let choose: libloading::Symbol<EglChooseConfig> = lib
                 .get(b"eglChooseConfig\0")
                 .map_err(|e| GpuError::NoContext(e.to_string()))?;
+            // EGL_SURFACE_TYPE is explicitly zero, and both halves of that
+            // matter. Asking for EGL_PBUFFER_BIT matches nothing for GLES on
+            // the surfaceless platform; *omitting* the attribute is worse,
+            // because the spec's default is EGL_WINDOW_BIT, which matches
+            // nothing here either. Zero means "no surface capability required",
+            // which is the truth: this context renders only into framebuffer
+            // objects and never creates a surface at all.
             let attrs = [
                 EGL_SURFACE_TYPE,
-                EGL_PBUFFER_BIT,
+                0,
                 EGL_RENDERABLE_TYPE,
-                EGL_OPENGL_BIT,
+                if want_es { EGL_OPENGL_ES3_BIT } else { EGL_OPENGL_BIT },
                 EGL_RED_SIZE,
                 8,
                 EGL_GREEN_SIZE,
@@ -146,7 +196,10 @@ impl HeadlessContext {
             ];
             let context = create(display, config, EGL_NO_CONTEXT, ctx_attrs.as_ptr());
             if context == EGL_NO_CONTEXT {
-                return Err(GpuError::NoContext("eglCreateContext failed".into()));
+                let code = lib.get::<EglGetError>(b"eglGetError\0").map(|f| f()).unwrap_or(0);
+                return Err(GpuError::NoContext(format!(
+                    "eglCreateContext failed (EGL error 0x{code:x})"
+                )));
             }
 
             let make_current: libloading::Symbol<EglMakeCurrent> =

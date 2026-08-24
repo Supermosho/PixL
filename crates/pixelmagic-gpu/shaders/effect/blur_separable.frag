@@ -26,9 +26,14 @@ void main() {
         return;
     }
 
+    // Kept deliberately in step with `compute/blur_separable.comp`, which the
+    // test suite asserts produces the same image. Sigma is radius/3 so that the
+    // kernel is truncated at three standard deviations and captures 99.7% of
+    // its weight; truncating at 2σ, as an earlier version did, threw away
+    // enough of the tail to be visible as a faint edge.
     int taps = int(min(ceil(r), float(MAX_TAPS)));
-    float step_scale = r / float(taps);
-    float sigma = max(r * 0.5, 0.3);
+    float step_scale = (r <= float(MAX_TAPS)) ? 1.0 : r / float(MAX_TAPS);
+    float sigma = max(r / 3.0, 0.4);
     float inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
 
     vec4 sum = vec4(0.0);

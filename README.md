@@ -50,13 +50,19 @@ cargo build --release
 
 ```sh
 cargo test                          # model, engine and I/O
-./target/release/pixelmagic --check-shaders   # compiles all 41 shaders headlessly
+./target/release/pixelmagic --check-shaders   # compiles all 43 shaders headlessly
 ./scripts/smoke-test.sh             # launches the app under Xvfb and drives it
 ```
 
 `--check-shaders` brings up a surfaceless EGL context, compiles the entire
 shader library and exits non-zero on the first failure. It needs no display and
 no GPU — Mesa's software rasteriser is enough — which makes it usable in CI.
+
+The headless tests run on desktop GL. GTK hands the application a **GLES**
+context on many systems, and the two do not have the same entry points, so the
+smoke test — which drives the real app against the real context — is not
+optional. It is the only thing that would have caught a desktop-only function
+call in the histogram readback, and it did.
 
 ---
 
@@ -68,12 +74,14 @@ others.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `pixelmagic-core` | Document model: layers, adjustments, effects, masks, selections, history. Pure data and pure functions — no GTK, no GL, no I/O. | — |
-| `pixelmagic-gpu` | OpenGL shader library and the render graph. Owns no GTK types. | core |
+| `pixelmagic-gpu` | OpenGL shader library (fragment + compute) and the render graph. Owns no GTK types. | core |
 | `pixelmagic-io` | Image decode/encode and the `.pxm` container. | core |
 | `pixelmagic-app` | GTK4 front end: canvas widget, sidebars, tools, actions. | all |
 
 The core crate having no dependency on a display server is what makes the model
-testable: 169 of the project's tests run without GTK, GL, or a window.
+testable: 169 of the project's 260 tests run without GTK, GL, or a window. The
+app touches exactly five symbols from the GPU crate, which is what makes the
+rendering backend genuinely replaceable rather than nominally so.
 
 ### The rendering pipeline
 
@@ -107,17 +115,57 @@ Three decisions in there are load-bearing, and each cost a bug to learn:
   Running `Overlay` in linear light pivots it around a mid-grey that is no
   longer perceptually mid.
 
+### Compute shaders
+
+Kernel-based passes run as compute shaders where the driver supports them
+(GL 4.3 / GLES 3.1), staging a tile of the image into workgroup shared memory so
+that a blur reads each pixel roughly once instead of once per tap.
+
+Compute is **not** unconditionally faster, and the code says so rather than
+assuming. Measured on llvmpipe at 1024², gaussian:
+
+| radius | fragment | compute | ratio |
+|-------:|---------:|--------:|------:|
+|      8 |   370 ms |  486 ms | 0.76× |
+|     24 |   670 ms |  625 ms | 1.07× |
+|     48 |  1110 ms |  747 ms | 1.49× |
+
+A dispatch has fixed overhead while the shared-memory saving scales with radius,
+so below a crossover the fragment path wins. `Renderer` uses compute only at or
+above `PIXELMAGIC_COMPUTE_BLUR_MIN` (default 12). A software rasteriser is the
+pessimistic case — it has no on-die scratchpad — so real hardware should cross
+over lower; `cargo run --release -p pixelmagic-gpu --example bench` measures it
+on yours.
+
+The histogram is the other half of the story, and the more interesting one: a
+fragment shader *cannot* compute one, because every invocation can only write to
+its own pixel. Compute plus atomics can, which is what puts a live histogram at
+the top of the Color Adjustments pane and what will make Auto Contrast and
+Auto Color possible.
+
+Every compute path has a fragment fallback that produces the same image, and the
+test suite renders both ways and diffs them — two implementations of one blur
+drift apart silently otherwise.
+
 ### Why OpenGL rather than Vulkan or wgpu
 
-The renderer has to hand frames to GTK. `GtkGLArea` provides a GL context that
-GTK already composites from, so rendering into it is zero-copy. Reaching the
-same point from wgpu means either reading every frame back to the CPU, or
-exporting Vulkan memory as a dma-buf and importing it as a `GdkDmabufTexture` —
-which works beautifully on Mesa and is fragile elsewhere. GL runs everywhere GTK
-runs, including software rasterisation.
+The decisive constraint is not preference, it is that **GTK4 has no Vulkan
+surface**. There is no `GtkVulkanArea`; GTK's own maintainers say so on the
+Vulkan Roadmap issue. GTK 4.15+ renders *itself* with Vulkan, but that is
+internal to GSK — an application cannot draw into it.
 
-`Renderer` owns no GTK types, so a future Vulkan backend is a rewrite of one
-crate, not of the app.
+So a Vulkan renderer's output has to reach GTK as a `GdkTexture`, either by
+exporting a dma-buf (zero-copy, but dependent on `VK_EXT_image_drm_format_modifier`
+and historically fragile on NVIDIA's proprietary driver) or by reading every
+frame back to the CPU (~32 MB per frame at 4K). `GtkGLArea` gives us a context
+GTK already composites from, so GL gets that handoff for free.
+
+What Vulkan would genuinely buy is compute — and GL 4.3 compute, which is what
+this crate now uses, delivers most of that at none of the interop risk. If the
+remaining gap ever matters (timeline semaphores, descriptor indexing, sharing a
+device with ONNX Runtime), `Renderer` owns no GTK types and the app touches five
+symbols from this crate, so a Vulkan backend is a rewrite of one crate rather
+than of the application.
 
 ---
 
@@ -134,14 +182,17 @@ About window reports both counts.
 |---|---|
 | Layer tree, groups, blend modes, opacity, masks | Working |
 | Non-destructive adjustment and effect stacks | Working |
-| GPU render graph, 41 shaders | Working, pixel-tested |
+| GPU render graph, 43 shaders (41 fragment + 2 compute) | Working, pixel-tested |
+| Compute-shader blur with fragment fallback, benchmarked crossover | Working |
+| Live histogram in the Color Adjustments pane | Working |
 | Painting, erasing, dodge/burn, saturate, soften, sharpen | Working |
 | Rectangular / oval / row / column selections, feather, boolean ops | Working (no marching-ants overlay yet — selections clip tools but are invisible) |
 | Undo/redo with gesture coalescing and region snapshots | Working |
 | Open PNG/JPEG/TIFF/WebP/BMP/GIF, save `.pxm`, export | Working |
 | Adjustments with generated panels (10 of 16) | Working |
-| Levels, Curves, colour wheels, Channel Mixer | Model + shaders exist; need bespoke editors |
+| Levels, Curves, colour wheels, Channel Mixer | Model, shaders and histogram exist; need bespoke editors |
 | Effects with shaders (41 of ~75) | Working |
+| Auto Contrast / Auto Color | Not started — the histogram they need now exists |
 | Shape, text and vector layers | Modelled, not rendered |
 | ML features (Super Resolution, Remove Background, …) | Not started — see the roadmap |
 | RAW, PSD, SVG, PDF import | Not started |

@@ -113,16 +113,16 @@ impl Texture {
         unsafe {
             let handle = gl.create_texture().map_err(GpuError::Gl)?;
             gl.bind_texture(glow::TEXTURE_2D, Some(handle));
-            gl.tex_image_2d(
+            // Immutable storage rather than `tex_image_2d`. Compute shaders
+            // bind these as images via `glBindImageTexture`, which requires an
+            // immutable format — a mutable texture is rejected outright on
+            // strict drivers and silently misbehaves on lenient ones.
+            gl.tex_storage_2d(
                 glow::TEXTURE_2D,
-                0,
-                format.internal() as i32,
+                1,
+                format.internal(),
                 width as i32,
                 height as i32,
-                0,
-                format.layout(),
-                format.component(),
-                glow::PixelUnpackData::Slice(None),
             );
             let f = match filter {
                 Filter::Nearest => glow::NEAREST,
@@ -276,20 +276,24 @@ impl RenderTarget {
         }
     }
 
-    /// Read back as straight-alpha, sRGB-encoded RGBA8.
+    /// Read an 8-bit target back verbatim.
     ///
-    /// Reads floats rather than letting GL narrow to bytes for us. The target
-    /// holds premultiplied linear light, and both of those have to be undone
-    /// before the result is a normal image file — narrowing first would
-    /// quantise linear values to 8 bits and crush the shadows, since most of
-    /// sRGB's code space lives below linear 0.2.
+    /// `GL_RGBA` + `GL_UNSIGNED_BYTE` is the one combination every GL and GLES
+    /// implementation is required to support, so this works everywhere. Use
+    /// [`crate::Renderer::read_image`] for a linear-light target — it encodes
+    /// through a shader first, because reading floats back is not portable.
     ///
     /// No vertical flip: the renderer's UV convention already puts document
     /// row 0 at framebuffer row 0 (see `quad.vert`).
-    pub fn read_srgb8_straight(&self) -> Result<Vec<u8>> {
-        use pixelmagic_core::color::linear_to_srgb;
+    pub fn read_rgba8(&self) -> Result<Vec<u8>> {
+        if self.texture.format != Format::Rgba8 && self.texture.format != Format::Srgb8 {
+            return Err(GpuError::Invalid(format!(
+                "read_rgba8 needs an 8-bit target, got {:?}",
+                self.texture.format
+            )));
+        }
         let (w, h) = (self.width() as usize, self.height() as usize);
-        let mut buf = vec![0f32; w * h * 4];
+        let mut buf = vec![0u8; w * h * 4];
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
@@ -299,25 +303,12 @@ impl RenderTarget {
                 w as i32,
                 h as i32,
                 glow::RGBA,
-                glow::FLOAT,
-                glow::PixelPackData::Slice(Some(bytemuck::cast_slice_mut(&mut buf))),
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut buf)),
             );
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
-
-        let mut out = vec![0u8; w * h * 4];
-        for i in 0..w * h {
-            let a = buf[i * 4 + 3].clamp(0.0, 1.0);
-            if a <= f32::EPSILON {
-                continue;
-            }
-            for c in 0..3 {
-                let linear = buf[i * 4 + c] / a;
-                out[i * 4 + c] = (linear_to_srgb(linear).clamp(0.0, 1.0) * 255.0).round() as u8;
-            }
-            out[i * 4 + 3] = (a * 255.0).round() as u8;
-        }
-        Ok(out)
+        Ok(buf)
     }
 }
 

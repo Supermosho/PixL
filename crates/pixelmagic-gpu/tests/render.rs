@@ -60,7 +60,7 @@ fn solid_doc(w: u32, h: u32, colors: &[(Rgba, BlendMode, f32)]) -> Document {
 fn render(renderer: &mut Renderer, doc: &Document) -> Result<Vec<u8>> {
     let revisions: HashMap<LayerId, u64> = HashMap::new();
     let target = renderer.render_document(doc, &revisions)?;
-    let px = target.read_srgb8_straight()?;
+    let px = renderer.read_image(&target)?;
     renderer.release(target);
     Ok(px)
 }
@@ -481,4 +481,328 @@ fn layer_textures_are_cached_between_frames() {
     let t = renderer.render_document(&doc, &revisions).unwrap();
     renderer.release(t);
     assert_eq!(renderer.stats.uploads, 1, "bumped revision should re-upload");
+}
+
+// ---------------------------------------------------------------------------
+// Compute shaders
+// ---------------------------------------------------------------------------
+
+/// Build a document with a hard vertical edge and a blur applied.
+fn blurred_edge_doc(size: u32, radius: f32, effect_id: &str) -> Document {
+    let mut buffer = PixelBuffer::new(size, size);
+    buffer.fill_rect(
+        pixelmagic_core::geom::Rect::new(0.0, 0.0, (size / 2) as f32, size as f32),
+        Rgba::WHITE,
+    );
+    buffer.fill_rect(
+        pixelmagic_core::geom::Rect::new(
+            (size / 2) as f32,
+            0.0,
+            (size / 2) as f32,
+            size as f32,
+        ),
+        Rgba::from_u8(20, 60, 200, 255),
+    );
+
+    let mut doc = Document::empty(size, size);
+    let id = doc.layers.insert("edge", LayerKind::Pixel { buffer }, None);
+    let mut effect = Effect::new(effect_id).unwrap();
+    effect.set("radius", ParamValue::Float(radius));
+    doc.layers.get_mut(id).unwrap().effects.push(effect);
+    doc
+}
+
+#[test]
+fn compute_is_available_on_this_driver() {
+    gl_test!(ctx);
+    let renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    let caps = renderer.capabilities();
+    eprintln!("capabilities: {}", caps.describe());
+    // Not an assertion that compute exists — that is a driver property, and the
+    // fallback is meant to work. Just make the answer visible in test output.
+    assert!(caps.version.0 >= 3, "expected at least GL/GLES 3.x");
+}
+
+#[test]
+fn every_compute_shader_compiles() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        eprintln!("skipping: no compute support");
+        return;
+    }
+    // precompile() covers fragment + compute; the count proves compute was
+    // included rather than silently skipped.
+    let n = renderer.precompile().expect("shaders should compile");
+    assert!(n >= 43, "expected fragment and compute shaders, got {n}");
+}
+
+/// The single most important test in this file.
+///
+/// Two implementations of the same blur will drift apart the moment someone
+/// edits one and not the other, and the drift is invisible — a slightly
+/// different sigma looks fine until you compare. Rendering the same scene both
+/// ways and diffing is the only thing that keeps them honest.
+#[test]
+fn the_blur_threshold_picks_a_path() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        return;
+    }
+    renderer.set_compute_blur_min_radius(20.0);
+
+    let small = blurred_edge_doc(64, 4.0, "gaussian-blur");
+    render(&mut renderer, &small).unwrap();
+    assert_eq!(renderer.stats.dispatches, 0, "a small radius should stay on fragment");
+
+    let large = blurred_edge_doc(64, 40.0, "gaussian-blur");
+    render(&mut renderer, &large).unwrap();
+    assert!(renderer.stats.dispatches > 0, "a large radius should dispatch compute");
+}
+
+#[test]
+fn compute_blur_matches_the_fragment_blur() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        eprintln!("skipping: no compute support");
+        return;
+    }
+
+    // Radii either side of the shared-memory cutoff (48), so both the LDS path
+    // and the wide fallback are covered.
+    for radius in [1.0f32, 4.0, 12.0, 31.0, 47.0, 64.0, 96.0] {
+        for effect in ["gaussian-blur", "box-blur"] {
+            let doc = blurred_edge_doc(96, radius, effect);
+
+            renderer.set_compute_enabled(true);
+            // Force compute even at radii where the heuristic would prefer the
+            // fragment path — the point here is to compare implementations.
+            renderer.set_compute_blur_min_radius(0.0);
+            let with_compute = render(&mut renderer, &doc).unwrap();
+            assert!(
+                renderer.stats.dispatches > 0,
+                "{effect} r={radius}: expected the compute path to be taken"
+            );
+
+            renderer.set_compute_enabled(false);
+            let with_fragment = render(&mut renderer, &doc).unwrap();
+            assert_eq!(
+                renderer.stats.dispatches, 0,
+                "{effect} r={radius}: expected the fragment path"
+            );
+
+            let mut worst = 0i32;
+            let mut worst_at = 0usize;
+            for (i, (a, b)) in with_compute.iter().zip(with_fragment.iter()).enumerate() {
+                let d = (*a as i32 - *b as i32).abs();
+                if d > worst {
+                    worst = d;
+                    worst_at = i;
+                }
+            }
+            // Both paths do the same arithmetic in a different order, so the
+            // f16 accumulation can differ in the last bit or two.
+            assert!(
+                worst <= 2,
+                "{effect} r={radius}: paths diverged by {worst} at byte {worst_at}\n  \
+                 compute {:?}\n  fragment {:?}",
+                &with_compute[worst_at & !3..(worst_at & !3) + 4],
+                &with_fragment[worst_at & !3..(worst_at & !3) + 4],
+            );
+        }
+    }
+
+    renderer.set_compute_enabled(true);
+}
+
+#[test]
+fn compute_blur_actually_blurs() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        return;
+    }
+    let doc = blurred_edge_doc(96, 16.0, "gaussian-blur");
+    renderer.set_compute_blur_min_radius(0.0);
+    let px = render(&mut renderer, &doc).unwrap();
+
+    // The edge should have become a ramp, and the far sides should be intact.
+    let edge = pixel_at(&px, 96, 48, 48)[0];
+    assert!((40..=220).contains(&(edge as i32)), "edge should be mid-ramp, got {edge}");
+    assert!(pixel_at(&px, 96, 2, 48)[0] > 230, "left edge should stay white");
+    assert!(pixel_at(&px, 96, 93, 48)[0] < 60, "right edge should stay blue");
+}
+
+#[test]
+fn sub_pixel_blur_radius_is_a_no_op_on_both_paths() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        return;
+    }
+    let doc = blurred_edge_doc(32, 0.2, "gaussian-blur");
+
+    renderer.set_compute_enabled(true);
+    renderer.set_compute_blur_min_radius(0.0);
+    let a = render(&mut renderer, &doc).unwrap();
+    renderer.set_compute_enabled(false);
+    let b = render(&mut renderer, &doc).unwrap();
+    renderer.set_compute_enabled(true);
+
+    assert_eq!(a, b, "a sub-pixel radius must pass through unchanged either way");
+    // And it really is unchanged: the edge is still hard.
+    assert!(pixel_at(&a, 32, 15, 16)[0] > 250);
+    assert!(pixel_at(&a, 32, 16, 16)[0] < 40);
+}
+
+// ---------------------------------------------------------------------------
+// Histogram
+// ---------------------------------------------------------------------------
+
+fn histogram_of(
+    renderer: &mut Renderer,
+    doc: &Document,
+) -> pixelmagic_gpu::renderer::Histogram {
+    let revisions: HashMap<LayerId, u64> = HashMap::new();
+    let target = renderer.render_document(doc, &revisions).unwrap();
+    let h = renderer.histogram(&target).unwrap();
+    renderer.release(target);
+    h
+}
+
+#[test]
+fn histogram_of_a_flat_colour_is_a_single_spike() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    use pixelmagic_gpu::renderer::Histogram;
+
+    let doc = solid_doc(64, 64, &[(Rgba::from_u8(200, 100, 50, 255), BlendMode::Normal, 1.0)]);
+    let h = histogram_of(&mut renderer, &doc);
+
+    assert_eq!(h.total, 64 * 64, "every opaque pixel should be counted");
+    // Allow a bin either side: the f16 round trip can nudge a value across a
+    // bin boundary.
+    let red_mass: u32 = h.bins[Histogram::RED][199..=201].iter().sum();
+    assert_eq!(red_mass, 64 * 64, "red should be one spike at ~200");
+    let green_mass: u32 = h.bins[Histogram::GREEN][99..=101].iter().sum();
+    assert_eq!(green_mass, 64 * 64);
+    let blue_mass: u32 = h.bins[Histogram::BLUE][49..=51].iter().sum();
+    assert_eq!(blue_mass, 64 * 64);
+}
+
+#[test]
+fn histogram_ignores_transparent_pixels() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    // A 64×64 canvas with only the left half painted.
+    let mut buffer = PixelBuffer::new(64, 64);
+    buffer.fill_rect(
+        pixelmagic_core::geom::Rect::new(0.0, 0.0, 32.0, 64.0),
+        Rgba::from_u8(128, 128, 128, 255),
+    );
+    let mut doc = Document::empty(64, 64);
+    doc.layers.insert("half", LayerKind::Pixel { buffer }, None);
+
+    let h = histogram_of(&mut renderer, &doc);
+    assert_eq!(h.total, 32 * 64, "transparent half must not be binned");
+}
+
+#[test]
+fn histogram_of_a_gradient_is_broad() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    use pixelmagic_gpu::renderer::Histogram;
+
+    let mut buffer = PixelBuffer::new(256, 8);
+    for y in 0..8 {
+        for x in 0..256 {
+            buffer.set(x, y, Rgba::from_u8(x as u8, x as u8, x as u8, 255));
+        }
+    }
+    let mut doc = Document::empty(256, 8);
+    doc.layers.insert("ramp", LayerKind::Pixel { buffer }, None);
+
+    let h = histogram_of(&mut renderer, &doc);
+    assert_eq!(h.total, 256 * 8);
+    let occupied = h.bins[Histogram::LUMA].iter().filter(|&&v| v > 0).count();
+    assert!(occupied > 200, "a full ramp should occupy most bins, got {occupied}");
+    // Evenly spread: no bin should dominate.
+    assert!(h.peak(Histogram::LUMA) <= 16, "unexpected spike: {}", h.peak(Histogram::LUMA));
+}
+
+#[test]
+fn compute_and_cpu_histograms_agree() {
+    gl_test!(ctx);
+    use pixelmagic_gpu::renderer::Histogram;
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    if !renderer.capabilities().compute {
+        eprintln!("skipping: no compute support");
+        return;
+    }
+
+    let mut buffer = PixelBuffer::new(97, 61); // deliberately not a round number
+    for y in 0..61 {
+        for x in 0..97 {
+            buffer.set(
+                x,
+                y,
+                Rgba::from_u8((x * 2) as u8, (y * 4) as u8, ((x + y) * 3) as u8, 255),
+            );
+        }
+    }
+    let mut doc = Document::empty(97, 61);
+    doc.layers.insert("noise", LayerKind::Pixel { buffer }, None);
+
+    renderer.set_compute_enabled(true);
+    let gpu = histogram_of(&mut renderer, &doc);
+    renderer.set_compute_enabled(false);
+    let cpu = histogram_of(&mut renderer, &doc);
+    renderer.set_compute_enabled(true);
+
+    assert_eq!(gpu.total, cpu.total, "pixel counts must match");
+    assert_eq!(gpu.total, 97 * 61);
+
+    // Red, green and blue must agree bin for bin: both paths quantise the same
+    // encoded value with the same rounding.
+    for channel in [Histogram::RED, Histogram::GREEN, Histogram::BLUE] {
+        for bin in 0..256 {
+            let (a, b) = (gpu.bins[channel][bin], cpu.bins[channel][bin]);
+            assert_eq!(a, b, "channel {channel} bin {bin}: gpu {a} vs cpu {b}");
+        }
+    }
+
+    // Luminance cannot agree exactly, and the GPU is the more accurate of the
+    // two: it weights full-precision channels, whereas the CPU fallback can
+    // only weight the 8-bit values it read back, so its inputs are already
+    // quantised. That shifts a handful of pixels into a neighbouring bin.
+    //
+    // Comparing cumulative distributions instead of raw bins is the right test:
+    // it is insensitive to a pixel moving one bin, but would still catch a real
+    // disagreement about the shape of the histogram.
+    let mut gpu_run = 0u32;
+    let mut cpu_run = 0u32;
+    let tolerance = (gpu.total as f64 * 0.02).ceil() as u32;
+    for bin in 0..256 {
+        gpu_run += gpu.bins[Histogram::LUMA][bin];
+        cpu_run += cpu.bins[Histogram::LUMA][bin];
+        assert!(
+            gpu_run.abs_diff(cpu_run) <= tolerance,
+            "luma cumulative diverged at bin {bin}: gpu {gpu_run} vs cpu {cpu_run} \
+             (tolerance {tolerance})"
+        );
+    }
+    assert_eq!(gpu_run, cpu_run, "both must account for every pixel");
+}
+
+#[test]
+fn histogram_of_an_empty_document_is_empty() {
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+    let doc = Document::empty(16, 16);
+    let h = histogram_of(&mut renderer, &doc);
+    assert!(h.is_empty());
+    assert_eq!(h.peak(0), 0);
 }

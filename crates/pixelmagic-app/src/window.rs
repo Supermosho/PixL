@@ -253,7 +253,10 @@ impl Window {
         let tool = self.state.borrow().tool;
         let panel = match tool {
             Tool::ColorAdjustments => {
-                build_adjustments_panel(self.state.clone(), on_change.clone())
+                // Computing this means rendering the document, so it happens
+                // only when the pane is actually being shown.
+                let histogram = self.canvas.histogram();
+                build_adjustments_panel(self.state.clone(), on_change.clone(), histogram)
             }
             Tool::Effects => build_effects_panel(self.state.clone(), on_change.clone()),
             _ => build_tool_options(self.state.clone(), on_change.clone()),

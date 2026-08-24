@@ -220,6 +220,7 @@ macro_rules! shader_sources {
 shader_sources! {
     "composite" => "composite.frag",
     "present" => "present.frag",
+    "encode_srgb" => "encode_srgb.frag",
     "place" => "place.frag",
     "mask_apply" => "mask_apply.frag",
 

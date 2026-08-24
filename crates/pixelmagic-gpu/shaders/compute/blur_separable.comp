@@ -1,0 +1,95 @@
+// Separable blur, staged through workgroup shared memory.
+//
+// The fragment version of this pass reads every pixel (2·taps + 1) times
+// through the texture unit. Here, one workgroup covers a 128-pixel run along
+// the blur axis, loads that run plus its halo into shared memory **once**, and
+// then all 128 threads read their windows out of shared memory. At radius 32
+// that turns 65 texture fetches per pixel into roughly 1.5.
+//
+// Must produce bit-comparable output to `effect/blur_separable.frag`; the test
+// suite asserts the two agree. Keep the tap and sigma arithmetic below in step
+// with that shader.
+
+layout(local_size_x = 128, local_size_y = 1) in;
+
+layout(rgba16f, binding = 0) writeonly uniform image2D u_dst;
+uniform sampler2D u_src;
+uniform ivec2 u_size;
+uniform ivec2 u_direction;   // (1,0) horizontal, (0,1) vertical
+uniform float u_radius;
+uniform int u_kernel;        // 0 = gaussian, 1 = box
+
+const int TILE = 128;
+// Beyond this the halo stops fitting in a comfortable shared-memory budget, so
+// the shader falls back to sampling directly. 128 + 2·48 vec4s is 3.5 KB, well
+// inside the 16 KB the spec guarantees.
+const int MAX_LDS_RADIUS = 48;
+const int MAX_TAPS = 64;
+
+shared vec4 s_line[TILE + 2 * MAX_LDS_RADIUS];
+
+void main() {
+    int lid = int(gl_LocalInvocationID.x);
+    int group_start = int(gl_WorkGroupID.x) * TILE;
+    int across = int(gl_WorkGroupID.y);
+
+    bool horizontal = (u_direction.x != 0);
+    int along_len = horizontal ? u_size.x : u_size.y;
+    int across_len = horizontal ? u_size.y : u_size.x;
+
+    float r = max(u_radius, 0.0);
+    // A sub-half-pixel radius is a no-op; zero taps makes the loop below run
+    // once at offset zero with weight one, which copies the source through
+    // exactly — matching the fragment shader's early return.
+    int taps = (r < 0.5) ? 0 : int(min(ceil(r), float(MAX_TAPS)));
+    // Unit steps while the kernel fits; only widen once it does not, which is
+    // the same compromise the fragment shader makes.
+    float step_scale = (r <= float(MAX_TAPS)) ? 1.0 : r / float(MAX_TAPS);
+    float sigma = max(r / 3.0, 0.4);
+    float inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+
+    // Uniform across the whole workgroup, so the barrier below stays uniform.
+    bool use_lds = (taps <= MAX_LDS_RADIUS) && (step_scale == 1.0);
+    int safe_across = clamp(across, 0, max(across_len - 1, 0));
+
+    if (use_lds) {
+        int span = TILE + 2 * taps;
+        for (int i = lid; i < span; i += TILE) {
+            int a = clamp(group_start - taps + i, 0, max(along_len - 1, 0));
+            ivec2 p = horizontal ? ivec2(a, safe_across) : ivec2(safe_across, a);
+            s_line[i] = texelFetch(u_src, p, 0);
+        }
+    }
+    // Unconditional: every invocation in the group must reach the same barrier,
+    // and an early return before one is undefined behaviour.
+    barrier();
+
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    vec2 inv_size = 1.0 / vec2(u_size);
+
+    for (int i = -MAX_TAPS; i <= MAX_TAPS; i++) {
+        if (i < -taps || i > taps) continue;
+        float d = float(i) * step_scale;
+        float w = (u_kernel == 0) ? exp(-d * d * inv_two_sigma_sq) : 1.0;
+
+        vec4 s;
+        if (use_lds) {
+            s = s_line[lid + taps + i];
+        } else {
+            // Wide-radius path: bilinear, matching the fragment shader exactly.
+            vec2 base = vec2(horizontal ? float(group_start + lid) : float(safe_across),
+                             horizontal ? float(safe_across) : float(group_start + lid));
+            vec2 uv = (base + 0.5) * inv_size + vec2(u_direction) * inv_size * d;
+            s = texture(u_src, clamp(uv, vec2(0.0), vec2(1.0)));
+        }
+        sum += s * w;
+        wsum += w;
+    }
+
+    int a_out = group_start + lid;
+    if (a_out < along_len && across < across_len) {
+        ivec2 p = horizontal ? ivec2(a_out, across) : ivec2(across, a_out);
+        imageStore(u_dst, p, sum / max(wsum, EPS));
+    }
+}

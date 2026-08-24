@@ -1,0 +1,66 @@
+// Image histogram: 256 bins each for red, green, blue and luminance.
+//
+// This is the pass that a fragment shader cannot express at all. A histogram
+// needs scattered writes — every pixel increments an arbitrary bin — and
+// fragment shaders can only write to their own destination pixel. Compute plus
+// atomics is the whole reason this is possible.
+//
+// Contention matters: a million pixels all incrementing 1024 global counters
+// would serialise badly. So each workgroup accumulates into its own copy in
+// shared memory first, and only merges into the global buffer once — turning
+// ~262,000 global atomics per workgroup into 1,024.
+//
+// Bins are indexed on **encoded** sRGB values, because that is the space a
+// histogram is read in: an evenly exposed photograph should look evenly spread.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform sampler2D u_src;
+uniform ivec2 u_size;
+
+layout(std430, binding = 0) buffer Histogram {
+    // 4 × 256: red, green, blue, luminance.
+    uint bins[];
+};
+
+const uint BIN_COUNT = 256u;
+const uint TOTAL_BINS = 1024u;
+const uint GROUP_THREADS = 256u;
+
+shared uint s_bins[TOTAL_BINS];
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+
+    for (uint i = lid; i < TOTAL_BINS; i += GROUP_THREADS) {
+        s_bins[i] = 0u;
+    }
+    barrier();
+
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < u_size.x && p.y < u_size.y) {
+        vec4 c = texelFetch(u_src, p, 0);
+        // Fully transparent pixels are not image content; counting them would
+        // pile a spike onto bin 0 for any layer with padding around it.
+        if (c.a > EPS) {
+            vec3 rgb = clamp(linear_to_srgb(c.rgb / c.a), 0.0, 1.0);
+            uint ri = uint(rgb.r * 255.0 + 0.5);
+            uint gi = uint(rgb.g * 255.0 + 0.5);
+            uint bi = uint(rgb.b * 255.0 + 0.5);
+            uint li = uint(clamp(luminance(rgb), 0.0, 1.0) * 255.0 + 0.5);
+
+            atomicAdd(s_bins[ri], 1u);
+            atomicAdd(s_bins[BIN_COUNT + gi], 1u);
+            atomicAdd(s_bins[2u * BIN_COUNT + bi], 1u);
+            atomicAdd(s_bins[3u * BIN_COUNT + li], 1u);
+        }
+    }
+    barrier();
+
+    for (uint i = lid; i < TOTAL_BINS; i += GROUP_THREADS) {
+        uint v = s_bins[i];
+        if (v != 0u) {
+            atomicAdd(bins[i], v);
+        }
+    }
+}

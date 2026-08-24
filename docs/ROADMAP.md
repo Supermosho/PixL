@@ -28,6 +28,11 @@ makes the next one cheaper.
 - **I/O** — PNG, JPEG, TIFF, WebP, BMP, GIF; the `.pxm` container.
 - **App shell** — canvas with pan and zoom, tool rail, layers sidebar,
   generated adjustment and effect panels, keyboard shortcuts, export.
+- **Compute shaders** — capability detection with a fragment fallback for every
+  path, a shared-memory separable blur, and a benchmarked crossover radius below
+  which the fragment path is still faster.
+- **Histogram** — 256 bins × RGB + luma via compute atomics, drawn at the top of
+  the Color Adjustments pane. The thing a fragment shader cannot do at all.
 
 ---
 
@@ -37,7 +42,13 @@ The highest-value work, because the surface already exists and the panels
 generate themselves.
 
 - **Bespoke editors** for Levels, Curves, Channel Mixer and the colour wheels.
-  The models and shaders are written; each needs a custom widget.
+  The models, shaders and now the histogram are all in place; each needs a
+  custom widget that draws on top of it.
+- **Auto Contrast and Auto Color**, which are a short step from the histogram:
+  find the black and white points per channel and write them into Levels.
+- **Live histogram updates** during a slider drag. It currently refreshes when
+  the pane is opened, because recomputing it means re-rendering the document and
+  doing that per slider tick needs a debounce first.
 - **The remaining ~34 effects.** Most are 20–40 lines of GLSL against an
   existing pass structure. `EffectDescriptor::implemented` is the checklist.
 - **Layer styles rendered** — fill, stroke, inner and drop shadow. The model and
