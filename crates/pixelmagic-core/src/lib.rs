@@ -30,6 +30,7 @@ pub mod history;
 pub mod layer;
 pub mod macros;
 pub mod param;
+pub mod quickselect;
 pub mod selection;
 pub mod style;
 pub mod text;

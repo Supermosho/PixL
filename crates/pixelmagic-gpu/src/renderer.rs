@@ -98,6 +98,42 @@ impl Default for BackdropStyle {
     }
 }
 
+/// How a selection overlay is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectionOverlayStyle {
+    /// Dash animation phase in device pixels. Advance it every frame to make
+    /// the ants crawl; the direction of travel is the sign of the increment.
+    pub phase: f32,
+    /// Length of one light-plus-dark dash pair, in device pixels.
+    pub dash: f32,
+    /// Tint over the selected interior, straight (not premultiplied). Alpha 0
+    /// gives an outline only — what a committed selection wants. The Quick
+    /// Selection hover preview passes a translucent yellow.
+    pub fill: [f32; 4],
+    /// Coverage at which a pixel counts as selected.
+    pub threshold: f32,
+}
+
+impl Default for SelectionOverlayStyle {
+    fn default() -> Self {
+        Self { phase: 0.0, dash: 8.0, fill: [0.0; 4], threshold: 0.5 }
+    }
+}
+
+impl SelectionOverlayStyle {
+    /// The committed selection: ants, no fill.
+    pub fn ants(phase: f32) -> Self {
+        Self { phase, ..Self::default() }
+    }
+
+    /// The Quick Selection hover preview: what you would get if you clicked.
+    /// Yellow because that is what the reference does, and because it is the
+    /// hue least likely to be confused with a selection that already exists.
+    pub fn preview(phase: f32) -> Self {
+        Self { phase, fill: [1.0, 0.85, 0.1, 0.38], ..Self::default() }
+    }
+}
+
 /// A 256-bin histogram of the composited image.
 ///
 /// Channels are red, green, blue and luminance, binned on **encoded** sRGB
@@ -1524,6 +1560,66 @@ impl Renderer {
         unsafe { self.gl.disable(glow::BLEND) };
         self.pool.release(blurred);
         Ok(())
+    }
+
+    /// Draw a selection overlay: marching ants, optionally over a tinted fill.
+    ///
+    /// `viewport` is the document's rectangle on screen, in the same
+    /// bottom-left-origin device pixels [`Renderer::present`] takes, so the
+    /// overlay lands exactly on the image it describes at any zoom or pan.
+    ///
+    /// The mask is a single-channel texture at *document* resolution; the
+    /// shader turns it into a screen-space outline, which is why this cannot
+    /// simply be another effect pass in the graph — it has to run after the
+    /// document has been placed on screen and know where that was.
+    pub fn draw_selection_overlay(
+        &mut self,
+        mask: &Texture,
+        viewport: (i32, i32, i32, i32),
+        style: SelectionOverlayStyle,
+        target: Option<glow::Framebuffer>,
+    ) -> Result<()> {
+        use glow::HasContext;
+        if viewport.2 <= 0 || viewport.3 <= 0 {
+            return Ok(());
+        }
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, target);
+            self.gl.viewport(viewport.0, viewport.1, viewport.2, viewport.3);
+            self.gl.enable(glow::BLEND);
+            // Premultiplied, matching what the shader writes.
+            self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        }
+
+        // Device pixels per document pixel, taken from the viewport rather
+        // than passed in: the two can only disagree if a caller computes zoom
+        // differently from how it sized the viewport, and then the ants would
+        // sit at the wrong thickness with nothing to explain why.
+        let scale = viewport.2 as f32 / (mask.width.max(1)) as f32;
+
+        let handle = mask.handle();
+        let p = self.shaders.get("selection_overlay")?;
+        p.bind();
+        p.set_texture("u_mask", 0, handle);
+        p.set_vec2("u_doc_size", [mask.width as f32, mask.height as f32]);
+        p.set_f32("u_scale", scale);
+        p.set_f32("u_phase", style.phase);
+        p.set_f32("u_dash", style.dash);
+        p.set_vec4("u_fill", style.fill);
+        p.set_f32("u_threshold", style.threshold);
+        self.draw_quad();
+        self.stats.passes += 1;
+
+        unsafe { self.gl.disable(glow::BLEND) };
+        Ok(())
+    }
+
+    /// The GL context this renderer was built on, so a host can create
+    /// textures that will be valid to pass back in — a selection mask, for
+    /// instance. Sharing the handle is the point: a texture made on any other
+    /// context would be rejected here.
+    pub fn context(&self) -> Rc<glow::Context> {
+        self.gl.clone()
     }
 
     /// An 8-bit target from the pool, for a caller that needs somewhere to

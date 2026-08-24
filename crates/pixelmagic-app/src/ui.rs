@@ -1692,6 +1692,242 @@ fn brush_controls() -> Vec<BrushControl> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Quick Selection
+// ---------------------------------------------------------------------------
+
+/// The Quick Selection panel.
+///
+/// Laid out after the original: the four combine modes as radio buttons with
+/// a line of explanation each, then the brush size, then the checkboxes, then
+/// the command buttons. Two of those commands are not implemented and say so
+/// rather than being left out — a panel missing "Select Subject" would suggest
+/// the tool is complete, and it is not.
+pub fn build_quick_select_panel(
+    state: Rc<RefCell<EditorState>>,
+    on_change: Rc<dyn Fn()>,
+) -> gtk::Widget {
+    use pixelmagic_core::buffer::MaskOp;
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.set_margin_start(8);
+    outer.set_margin_end(8);
+    outer.set_margin_bottom(10);
+    outer.set_vexpand(true);
+
+    // -- combine mode --------------------------------------------------------
+    let current_mode = state.borrow().quick_select.mode;
+    let mut first_radio: Option<gtk::CheckButton> = None;
+
+    for (mode, blurb) in [
+        (MaskOp::Replace, "Creates a new selection."),
+        (MaskOp::Add, "Allows you to add areas to your existing selection."),
+        (MaskOp::Subtract, "Allows you to subtract areas from your existing selection."),
+        (
+            MaskOp::Intersect,
+            "Constrains the bounds of the new selection to the existing selection.",
+        ),
+    ] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_top(6);
+
+        let radio = gtk::CheckButton::new();
+        radio.set_valign(gtk::Align::Start);
+        radio.add_css_class("pm-radio");
+        match &first_radio {
+            None => first_radio = Some(radio.clone()),
+            Some(f) => radio.set_group(Some(f)),
+        }
+        radio.set_active(mode == current_mode);
+
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // "New" rather than "Replace": the model's name for the operation is
+        // not the user's name for the button.
+        let name = gtk::Label::new(Some(quick_select_mode_label(mode)));
+        name.set_xalign(0.0);
+        let detail = gtk::Label::new(Some(blurb));
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        detail.add_css_class("dim-label");
+        detail.add_css_class("caption");
+        text.append(&name);
+        text.append(&detail);
+
+        row.append(&radio);
+        row.append(&text);
+        outer.append(&row);
+
+        let state = state.clone();
+        let on_change = on_change.clone();
+        radio.connect_toggled(move |r| {
+            if r.is_active() {
+                state.borrow_mut().quick_select.mode = mode;
+                on_change();
+            }
+        });
+    }
+
+    // -- brush size ----------------------------------------------------------
+    let size_head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    size_head.set_margin_top(12);
+    let size_label = gtk::Label::new(Some("Brush Size"));
+    size_label.set_xalign(0.0);
+    size_label.set_hexpand(true);
+    let size_value = gtk::Label::new(None);
+    size_value.add_css_class("dim-label");
+    size_head.append(&size_label);
+    size_head.append(&size_value);
+    outer.append(&size_head);
+
+    let size = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    size.add_css_class("pm-opacity");
+    size.set_draw_value(false);
+    size.set_value((state.borrow().quick_select.reach_percent() * 100.0) as f64);
+    size_value.set_text(&format!("{:.0}%", size.value()));
+    outer.append(&size);
+    {
+        let state = state.clone();
+        let size_value = size_value.clone();
+        let on_change = on_change.clone();
+        size.connect_value_changed(move |s| {
+            state.borrow_mut().quick_select.set_reach_percent(s.value() as f32 / 100.0);
+            size_value.set_text(&format!("{:.0}%", s.value()));
+            on_change();
+        });
+    }
+
+    // -- tolerance -----------------------------------------------------------
+    //
+    // Not in the original's panel. Ours is a colour flood fill rather than a
+    // trained segmentation, so this is the control that decides whether the
+    // tool works at all on a given image; hiding it would be cargo-culting the
+    // interface without the machinery that lets the original get away with it.
+    let tol_head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    tol_head.set_margin_top(8);
+    let tol_label = gtk::Label::new(Some("Tolerance"));
+    tol_label.set_xalign(0.0);
+    tol_label.set_hexpand(true);
+    tol_label.set_tooltip_text(Some(
+        "How different a neighbouring pixel may be before the region stops growing.",
+    ));
+    let tol_value = gtk::Label::new(None);
+    tol_value.add_css_class("dim-label");
+    tol_head.append(&tol_label);
+    tol_head.append(&tol_value);
+    outer.append(&tol_head);
+
+    let tol = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 100.0, 1.0);
+    tol.add_css_class("pm-opacity");
+    tol.set_draw_value(false);
+    tol.set_value((state.borrow().quick_select.tolerance * 100.0) as f64);
+    tol_value.set_text(&format!("{:.0}%", tol.value()));
+    outer.append(&tol);
+    {
+        let state = state.clone();
+        let tol_value = tol_value.clone();
+        let on_change = on_change.clone();
+        tol.connect_value_changed(move |s| {
+            state.borrow_mut().quick_select.tolerance = s.value() as f32 / 100.0;
+            tol_value.set_text(&format!("{:.0}%", s.value()));
+            on_change();
+        });
+    }
+
+    // -- checkboxes ----------------------------------------------------------
+    for (label, tooltip, get, set) in [
+        (
+            "Sample all layers",
+            "Grow the region from the composited image rather than the active layer alone.",
+            Box::new(|s: &EditorState| s.quick_select.sample_all_layers)
+                as Box<dyn Fn(&EditorState) -> bool>,
+            Box::new(|s: &mut EditorState, v: bool| s.quick_select.sample_all_layers = v)
+                as Box<dyn Fn(&mut EditorState, bool)>,
+        ),
+        (
+            "Show selection preview",
+            "Highlight in yellow what would be selected under the pointer.",
+            Box::new(|s: &EditorState| s.quick_select.show_preview),
+            Box::new(|s: &mut EditorState, v: bool| s.quick_select.show_preview = v),
+        ),
+    ] {
+        let check = gtk::CheckButton::with_label(label);
+        check.set_margin_top(8);
+        check.set_tooltip_text(Some(tooltip));
+        check.add_css_class("pm-visible");
+        check.set_active(get(&state.borrow()));
+        let state = state.clone();
+        let on_change = on_change.clone();
+        check.connect_toggled(move |c| {
+            set(&mut state.borrow_mut(), c.is_active());
+            on_change();
+        });
+        outer.append(&check);
+    }
+
+    // -- commands ------------------------------------------------------------
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_size_request(-1, 8);
+    outer.append(&spacer);
+
+    for (label, why) in [
+        (
+            "Select Subject",
+            "Not implemented: finding the subject of a photograph needs a trained \
+             segmentation model, which Pixelmagic does not ship yet.",
+        ),
+        (
+            "Select and Mask…",
+            "Not implemented: this opens a dedicated edge-refinement workspace.",
+        ),
+    ] {
+        let b = gtk::Button::with_label(label);
+        b.set_margin_top(6);
+        b.set_sensitive(false);
+        b.set_tooltip_text(Some(why));
+        outer.append(&b);
+    }
+
+    let invert = gtk::Button::with_label("Invert Selection");
+    invert.set_margin_top(6);
+    invert.set_action_name(Some("win.select-invert"));
+    outer.append(&invert);
+
+    let reselect = gtk::Button::with_label("Reselect");
+    reselect.set_margin_top(6);
+    reselect.set_sensitive(state.borrow().can_reselect());
+    reselect.set_tooltip_text(Some("Bring back the selection you last dismissed."));
+    {
+        let state = state.clone();
+        let on_change = on_change.clone();
+        reselect.connect_clicked(move |_| {
+            let restored = state.borrow_mut().reselect();
+            if restored {
+                on_change();
+            }
+        });
+    }
+    outer.append(&reselect);
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&outer));
+    scroller.upcast()
+}
+
+/// The panel's name for a combine mode, which is not the model's name for it:
+/// the operation is `Replace`, the button is "New".
+fn quick_select_mode_label(op: pixelmagic_core::buffer::MaskOp) -> &'static str {
+    use pixelmagic_core::buffer::MaskOp;
+    match op {
+        MaskOp::Replace => "New",
+        MaskOp::Add => "Add",
+        MaskOp::Subtract => "Subtract",
+        MaskOp::Intersect => "Intersect",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

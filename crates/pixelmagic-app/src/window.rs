@@ -29,8 +29,8 @@ use crate::style::metrics;
 /// Height of the info strip, which the document should not sit under.
 const STATUS_HEIGHT: i32 = 22;
 use crate::ui::{
-    build_adjustments_panel, build_arrange_panel, build_effects_panel, build_tool_options,
-    LayersSidebar, ToolRail,
+    build_adjustments_panel, build_arrange_panel, build_effects_panel,
+    build_quick_select_panel, build_tool_options, LayersSidebar, ToolRail,
 };
 
 pub struct Window {
@@ -354,6 +354,13 @@ impl Window {
 
         self.options_title.set_text(tool.label());
         self.rail.set_active_silently(tool);
+
+        // Switching away from Quick Selection — or turning its preview off —
+        // must take the yellow highlight with it. Left behind, it is
+        // indistinguishable from a selection the user actually made.
+        if crate::canvas::canvas_action(tool) != crate::canvas::CanvasAction::QuickSelect {
+            self.canvas.clear_preview();
+        }
     }
 
     fn rebuild_options(self: &Rc<Self>) {
@@ -377,6 +384,9 @@ impl Window {
             }
             Tool::Effects => build_effects_panel(self.state.clone(), on_change.clone()),
             Tool::Arrange => build_arrange_panel(self.state.clone(), on_change.clone()),
+            Tool::QuickSelection => {
+                build_quick_select_panel(self.state.clone(), on_change.clone())
+            }
             _ => build_tool_options(self.state.clone(), on_change.clone()),
         };
         self.options_body.append(&panel);
@@ -430,11 +440,11 @@ impl Window {
         });
 
         self.add_action("select-all", |w| {
-            w.state.borrow_mut().document.select_all();
+            w.state.borrow_mut().select_all();
             w.refresh();
         });
         self.add_action("deselect", |w| {
-            w.state.borrow_mut().document.deselect();
+            w.state.borrow_mut().deselect();
             w.refresh();
         });
         self.add_action("select-invert", |w| {

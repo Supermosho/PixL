@@ -145,14 +145,39 @@ xdotool key ctrl+z; shot 06-undone
 changed 05-painted 06-undone "Ctrl+Z undid the stroke"
 
 echo "== selection tool =="
+# Coordinates must land on the canvas, not on a floating panel. The Layers
+# panel occupies roughly x < 300, and a drag starting inside it selects
+# nothing at all — which is how this step spent a while "passing" while the
+# marching-ants check below failed for a reason that had nothing to do with
+# the ants.
 xdotool key m
-xdotool mousemove 250 300 mousedown 1
-xdotool mousemove 550 550
+xdotool mousemove 500 350 mousedown 1
+xdotool mousemove 650 450
+xdotool mousemove 800 600
 xdotool mouseup 1
 shot 07-selection
+changed 06-undone 07-selection "dragging the marquee made a selection"
+
+echo "== marching ants =="
+# Two captures of the same selection a moment apart. If they are identical the
+# ants are not animating, which is the difference between a selection outline
+# and a static dotted rectangle.
+sleep 1
+import -window root "$OUT/08-ants-a.png" 2>/dev/null
+sleep 1
+import -window root "$OUT/08-ants-b.png" 2>/dev/null
+changed 08-ants-a 08-ants-b "the marching ants animate"
+
+echo "== quick selection =="
+xdotool key q; shot 09-quick-select
+changed 08-ants-a 09-quick-select "'q' opened the Quick Selection panel"
+# Hovering must paint the preview without any click.
+xdotool mousemove 700 520; sleep 2
+import -window root "$OUT/10-quick-hover.png" 2>/dev/null
+changed 09-quick-select 10-quick-hover "hovering shows the Quick Selection preview"
 
 echo "== zoom =="
-xdotool key ctrl+0; shot 08-zoom-fit
+xdotool key ctrl+0; shot 11-zoom-fit
 
 kill $APP 2>/dev/null
 wait $APP 2>/dev/null

@@ -919,3 +919,168 @@ fn backdrop_with_no_rectangles_leaves_the_frame_alone() {
     let c = pixel_at(&px, w, w / 2, h / 2);
     assert!(c[0] > 200 && c[1] < 40, "the no-op path changed the frame: {c:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Selection overlay
+// ---------------------------------------------------------------------------
+
+/// Build a single-channel mask texture with a solid rectangle in it.
+fn mask_texture(
+    ctx: &HeadlessContext,
+    w: u32,
+    h: u32,
+    rect: (u32, u32, u32, u32),
+) -> pixelmagic_gpu::texture::Texture {
+    use pixelmagic_gpu::texture::{Filter, Format, Texture, Wrap};
+    let mut data = vec![0u8; (w * h) as usize];
+    let (rx, ry, rw, rh) = rect;
+    for y in ry..(ry + rh).min(h) {
+        for x in rx..(rx + rw).min(w) {
+            data[(y * w + x) as usize] = 255;
+        }
+    }
+    let tex =
+        Texture::new(ctx.gl.clone(), w, h, Format::R8, Filter::Nearest, Wrap::Clamp).unwrap();
+    tex.upload_raw(&data).unwrap();
+    tex
+}
+
+/// The overlay must mark the selection's *boundary* and leave both the
+/// interior and the exterior alone. Getting this backwards — filling the
+/// whole selection with ants — is the obvious failure mode and looks fine in
+/// a thumbnail, so it is worth an explicit test.
+#[test]
+fn selection_overlay_draws_the_boundary_and_not_the_interior() {
+    use pixelmagic_gpu::renderer::SelectionOverlayStyle;
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    let (w, h) = (64u32, 64u32);
+    // Deliberately **not** vertically centred. A symmetric rectangle looks
+    // identical whether or not the shader applies the same top-row flip that
+    // `present` does, so it cannot catch a mirrored overlay — which is exactly
+    // the bug this test failed to catch the first time round.
+    let mask = mask_texture(&ctx, w, h, (16, 8, 32, 20));
+
+    let scratch = renderer.acquire_rgba8(w, h).unwrap();
+    scratch.clear();
+
+    // Phase 0 with a long dash so the sampled boundary points are all in the
+    // *light* half of the pattern — otherwise a dark ant is indistinguishable
+    // from the cleared background and the test is checking nothing.
+    let style = SelectionOverlayStyle { dash: 4096.0, phase: 0.0, ..Default::default() };
+    renderer
+        .draw_selection_overlay(
+            &mask,
+            (0, 0, w as i32, h as i32),
+            style,
+            Some(scratch.framebuffer()),
+        )
+        .unwrap();
+
+    let px = scratch.read_rgba8().unwrap();
+    renderer.release(scratch);
+
+    // Read in the same top-left-origin space the mask was written in.
+    let at = |x: u32, y: u32| pixel_at(&px, w, x, h - 1 - y);
+
+    // Mask rows 8..28, columns 16..48.
+    let interior = at(32, 18);
+    assert!(interior[3] < 16, "the middle of the selection must stay clear, got {interior:?}");
+
+    let exterior = at(4, 4);
+    assert!(exterior[3] < 16, "outside the selection must stay clear, got {exterior:?}");
+
+    // Top edge, just inside. If the overlay were mirrored this would land in
+    // empty space and read as transparent.
+    let top = at(32, 8);
+    assert!(top[3] > 200, "the top boundary must be drawn, got {top:?}");
+
+    // Bottom edge, and the row just past it, which pins the vertical
+    // placement from both sides.
+    let bottom = at(32, 27);
+    assert!(bottom[3] > 200, "the bottom boundary must be drawn, got {bottom:?}");
+    let below = at(32, 29);
+    assert!(below[3] < 16, "below the selection must stay clear, got {below:?}");
+
+    // The left edge too, so this is not passing on one orientation only.
+    let left_edge = at(16, 18);
+    assert!(left_edge[3] > 200, "the left boundary must be drawn, got {left_edge:?}");
+}
+
+/// The hover preview tints the interior as well as outlining it — that is the
+/// whole difference between it and a committed selection, and it is what the
+/// user sees when deciding whether to click.
+#[test]
+fn preview_style_tints_the_interior() {
+    use pixelmagic_gpu::renderer::SelectionOverlayStyle;
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    let (w, h) = (64u32, 64u32);
+    let mask = mask_texture(&ctx, w, h, (16, 8, 32, 20));
+
+    let scratch = renderer.acquire_rgba8(w, h).unwrap();
+    scratch.clear();
+    renderer
+        .draw_selection_overlay(
+            &mask,
+            (0, 0, w as i32, h as i32),
+            SelectionOverlayStyle::preview(0.0),
+            Some(scratch.framebuffer()),
+        )
+        .unwrap();
+
+    let px = scratch.read_rgba8().unwrap();
+    renderer.release(scratch);
+    let at = |x: u32, y: u32| pixel_at(&px, w, x, h - 1 - y);
+
+    let interior = at(32, 18);
+    assert!(interior[3] > 40, "the preview must tint its interior, got {interior:?}");
+    assert!(
+        interior[0] > interior[2],
+        "the tint is yellow, so red must exceed blue: {interior:?}"
+    );
+
+    let exterior = at(4, 4);
+    assert!(exterior[3] < 16, "the tint must not escape the region, got {exterior:?}");
+}
+
+/// Advancing the phase must change which parts of the boundary are light and
+/// which are dark — otherwise the ants are painted on and do not march.
+#[test]
+fn advancing_the_phase_moves_the_dashes() {
+    use pixelmagic_gpu::renderer::SelectionOverlayStyle;
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    let (w, h) = (64u32, 64u32);
+    let mask = mask_texture(&ctx, w, h, (16, 16, 32, 32));
+
+    let sample = |renderer: &mut Renderer, phase: f32| -> Vec<u8> {
+        let scratch = renderer.acquire_rgba8(w, h).unwrap();
+        scratch.clear();
+        renderer
+            .draw_selection_overlay(
+                &mask,
+                (0, 0, w as i32, h as i32),
+                SelectionOverlayStyle::ants(phase),
+                Some(scratch.framebuffer()),
+            )
+            .unwrap();
+        let px = scratch.read_rgba8().unwrap();
+        renderer.release(scratch);
+        px
+    };
+
+    let a = sample(&mut renderer, 0.0);
+    // Half a dash period: every light segment should now be dark and vice
+    // versa, which is the largest possible difference.
+    let b = sample(&mut renderer, 4.0);
+
+    let differing = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+    assert!(
+        differing > 100,
+        "the dash pattern did not move with the phase ({differing} bytes differ)"
+    );
+}

@@ -14,7 +14,7 @@ use pixelmagic_core::geom::Rect;
 use pixelmagic_core::history::{Edit, History};
 use pixelmagic_core::layer::{LayerId, LayerKind};
 use pixelmagic_core::selection::{Selection, SelectionOptions};
-use pixelmagic_core::tool::{BrushSettings, Tool};
+use pixelmagic_core::tool::{BrushSettings, QuickSelectSettings, Tool};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -64,6 +64,7 @@ impl Default for View {
 
 impl View {
     pub const MIN_ZOOM: f32 = 0.02;
+    pub const MAX_ZOOM: f32 = 64.0;
 
     /// [`View::fit_with`] against the whole widget. Tests only — the
     /// application always has panels.
@@ -71,7 +72,6 @@ impl View {
     fn fit_no_insets(doc_w: f32, doc_h: f32, widget_w: f32, widget_h: f32) -> Self {
         Self::fit_with(doc_w, doc_h, widget_w, widget_h, Insets::default())
     }
-    pub const MAX_ZOOM: f32 = 64.0;
 
     /// Zoom so the whole document fits inside the area the panels leave free,
     /// with a small margin.
@@ -178,13 +178,21 @@ pub struct EditorState {
     pub brush: BrushSettings,
     pub colors: ColorPair,
     pub selection_options: SelectionOptions,
+    pub quick_select: QuickSelectSettings,
     pub gesture: Gesture,
+    /// The last non-empty selection, so Reselect can bring it back after a
+    /// deselect. Pixelmator's Reselect does exactly this and nothing more.
+    pub last_selection: Option<Selection>,
     /// Bumped per layer whenever its pixels change, so the renderer knows to
     /// re-upload without diffing megabytes.
     pub revisions: HashMap<LayerId, u64>,
     pub show_checkerboard: bool,
     /// Set when something has changed and the canvas needs a redraw.
     pub needs_redraw: bool,
+    /// Bumped whenever the selection changes, so the canvas knows to re-upload
+    /// the mask texture the overlay draws from. Comparing the masks themselves
+    /// would mean hashing megabytes on every frame.
+    pub selection_revision: u64,
 }
 
 impl EditorState {
@@ -197,10 +205,13 @@ impl EditorState {
             brush: BrushSettings::default(),
             colors: ColorPair::default(),
             selection_options: SelectionOptions::default(),
+            quick_select: QuickSelectSettings::default(),
             gesture: Gesture::None,
+            last_selection: None,
             revisions: HashMap::new(),
             show_checkerboard: true,
             needs_redraw: true,
+            selection_revision: 0,
         }
     }
 
@@ -298,6 +309,54 @@ impl EditorState {
         } else {
             Some(selection)
         };
+        self.touch_selection();
+    }
+
+    /// `Command-A`. Unlike [`EditorState::set_selection`] this keeps the
+    /// full-canvas mask rather than collapsing it to `None`, so the overlay
+    /// can draw ants around the whole canvas — which is what tells the user
+    /// the command did anything at all.
+    pub fn select_all(&mut self) {
+        self.document.select_all();
+        self.touch_selection();
+    }
+
+    pub fn deselect(&mut self) {
+        // Remember it first — that is the whole point of Reselect, and doing
+        // it here rather than in the action means every route to a deselect
+        // is covered, including the ones added later.
+        if let Some(sel) = self.document.selection.take() {
+            if !sel.is_empty() {
+                self.last_selection = Some(sel);
+            }
+        }
+        self.document.deselect();
+        self.touch_selection();
+    }
+
+    /// Bring back the selection that was last thrown away. Returns false when
+    /// there is nothing to restore, so the caller can leave the menu item and
+    /// the button insensitive rather than offering a no-op.
+    pub fn reselect(&mut self) -> bool {
+        match self.last_selection.take() {
+            Some(sel) => {
+                self.document.selection = Some(sel);
+                self.touch_selection();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn can_reselect(&self) -> bool {
+        self.last_selection.is_some()
+    }
+
+    /// Mark the selection as changed. Every path that alters
+    /// `document.selection` must go through here or the overlay will keep
+    /// drawing the previous one.
+    pub fn touch_selection(&mut self) {
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         self.needs_redraw = true;
     }
 }

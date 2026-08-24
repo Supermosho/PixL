@@ -3,13 +3,15 @@
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
-use pixelmagic_core::buffer::{MaskOp, PixelBuffer};
+use pixelmagic_core::buffer::{MaskBuffer, MaskOp, PixelBuffer};
 use pixelmagic_core::geom::Rect;
 use pixelmagic_core::history::PixelRegionEdit;
 use pixelmagic_core::layer::LayerKind;
+use pixelmagic_core::quickselect;
 use pixelmagic_core::selection::Selection;
 use pixelmagic_core::tool::{Tool, ToolCategory};
-use pixelmagic_gpu::renderer::{BackdropRect, BackdropStyle};
+use pixelmagic_gpu::renderer::{BackdropRect, BackdropStyle, SelectionOverlayStyle};
+use pixelmagic_gpu::texture::{Filter, Format, Texture, Wrap};
 use pixelmagic_gpu::Renderer;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,6 +23,48 @@ use crate::state::{EditorState, Gesture, View};
 /// `unrealize` — GL objects belong to the context and must not outlive it.
 struct CanvasGl {
     renderer: Renderer,
+    /// The selection mask on the GPU, with the revision it was built from.
+    /// Re-uploading a canvas-sized mask every frame would cost more than the
+    /// rest of the overlay put together, and the ants animate every frame.
+    selection: Option<(Texture, u64)>,
+    /// The Quick Selection hover preview, likewise cached by revision.
+    preview: Option<(Texture, u64)>,
+}
+
+impl CanvasGl {
+    /// Upload `mask` into `slot` unless the slot already holds this revision
+    /// at this size, and hand back the texture to draw with.
+    fn mask_texture<'a>(
+        gl: &Rc<glow::Context>,
+        slot: &'a mut Option<(Texture, u64)>,
+        mask: &MaskBuffer,
+        revision: u64,
+    ) -> Option<&'a Texture> {
+        let stale = match slot {
+            Some((tex, rev)) => {
+                *rev != revision || tex.width != mask.width() || tex.height != mask.height()
+            }
+            None => true,
+        };
+        if stale {
+            let tex = Texture::new(
+                gl.clone(),
+                mask.width(),
+                mask.height(),
+                Format::R8,
+                // Linear, so at high zoom the mask's edge ramps across the
+                // magnified texel instead of stepping, and the outline the
+                // shader derives from it follows the shape rather than the
+                // texel grid.
+                Filter::Linear,
+                Wrap::Clamp,
+            )
+            .ok()?;
+            tex.upload_raw(mask.data()).ok()?;
+            *slot = Some((tex, revision));
+        }
+        slot.as_ref().map(|(tex, _)| tex)
+    }
 }
 
 pub struct Canvas {
@@ -39,6 +83,15 @@ pub struct Canvas {
     /// renderer can frost the canvas underneath them. Empty means no frosting.
     backdrops: Rc<RefCell<Vec<BackdropRect>>>,
     backdrop_style: Rc<std::cell::Cell<BackdropStyle>>,
+    /// What Quick Selection would select if you clicked where the pointer is.
+    /// Transient hover state, so it lives here rather than in the document.
+    preview_mask: Rc<RefCell<Option<MaskBuffer>>>,
+    preview_revision: Rc<std::cell::Cell<u64>>,
+    /// Marching-ants animation phase, in device pixels.
+    ants_phase: Rc<std::cell::Cell<f32>>,
+    /// Pixels Quick Selection samples, with the key they were built from.
+    /// Shared by `Rc` so the hover path can use it without cloning a canvas.
+    sample_cache: RefCell<Option<(String, Rc<PixelBuffer>)>>,
 }
 
 impl Canvas {
@@ -57,6 +110,10 @@ impl Canvas {
             state,
             on_change: RefCell::new(Vec::new()),
             pending_edit: RefCell::new(None),
+            preview_mask: Rc::new(RefCell::new(None)),
+            preview_revision: Rc::new(std::cell::Cell::new(0)),
+            ants_phase: Rc::new(std::cell::Cell::new(0.0)),
+            sample_cache: RefCell::new(None),
             backdrops: Rc::new(RefCell::new(Vec::new())),
             backdrop_style: Rc::new(std::cell::Cell::new(BackdropStyle {
                 corner: crate::style::metrics::PANEL_CORNER,
@@ -66,6 +123,7 @@ impl Canvas {
 
         canvas.connect_gl();
         canvas.connect_input();
+        canvas.start_ant_animation();
         canvas
     }
 
@@ -106,7 +164,10 @@ impl Canvas {
             let flavor = pixelmagic_gpu::detect_flavor(&context);
             log::info!("GL flavour: {flavor:?}");
             match Renderer::new(context, flavor) {
-                Ok(r) => *gl_cell.borrow_mut() = Some(CanvasGl { renderer: r }),
+                Ok(r) => {
+                    *gl_cell.borrow_mut() =
+                        Some(CanvasGl { renderer: r, selection: None, preview: None })
+                }
                 Err(e) => log::error!("renderer init failed: {e}"),
             }
         });
@@ -123,6 +184,9 @@ impl Canvas {
         let state = self.state.clone();
         let backdrops = self.backdrops.clone();
         let backdrop_style = self.backdrop_style.clone();
+        let preview_mask = self.preview_mask.clone();
+        let preview_revision = self.preview_revision.clone();
+        let ants_phase = self.ants_phase.clone();
         self.widget.connect_render(move |area, _ctx| {
             let mut gl_ref = gl_cell.borrow_mut();
             let Some(gl) = gl_ref.as_mut() else { return glib::Propagation::Proceed };
@@ -160,6 +224,55 @@ impl Canvas {
                         log::error!("present failed: {e}");
                     }
                     gl.renderer.release(image);
+
+                    // Selection chrome, drawn onto the same rectangle the
+                    // document just went to. Before the panel frosting, so a
+                    // selection that runs under a panel is blurred along with
+                    // the image rather than sitting sharply on top of it.
+                    let phase = ants_phase.get();
+                    let context = gl.renderer.context();
+
+                    let selection = state.borrow().document.selection.clone();
+                    if let Some(sel) = selection.as_ref() {
+                        let revision = state.borrow().selection_revision;
+                        if let Some(tex) = CanvasGl::mask_texture(
+                            &context,
+                            &mut gl.selection,
+                            sel.mask(),
+                            revision,
+                        ) {
+                            if let Err(e) = gl.renderer.draw_selection_overlay(
+                                tex,
+                                vp,
+                                SelectionOverlayStyle::ants(phase),
+                                target,
+                            ) {
+                                log::warn!("selection overlay failed: {e}");
+                            }
+                        }
+                    }
+
+                    // The Quick Selection hover preview goes on top of the
+                    // committed selection: it is what would be *added*, so it
+                    // has to be legible over what is already there.
+                    let preview = preview_mask.borrow();
+                    if let Some(mask) = preview.as_ref() {
+                        if let Some(tex) = CanvasGl::mask_texture(
+                            &context,
+                            &mut gl.preview,
+                            mask,
+                            preview_revision.get(),
+                        ) {
+                            if let Err(e) = gl.renderer.draw_selection_overlay(
+                                tex,
+                                vp,
+                                SelectionOverlayStyle::preview(phase),
+                                target,
+                            ) {
+                                log::warn!("preview overlay failed: {e}");
+                            }
+                        }
+                    }
                 }
                 Err(e) => log::error!("render failed: {e}"),
             }
@@ -217,6 +330,26 @@ impl Canvas {
         self.connect_drag();
         self.connect_scroll();
         self.connect_middle_drag();
+        self.connect_hover();
+    }
+
+    /// Pointer motion with no button held, which is what drives the Quick
+    /// Selection preview.
+    ///
+    /// `GtkGestureDrag` does not report these — it only starts once a button
+    /// goes down — so this needs its own controller. It also has to clear the
+    /// preview on leave, or the yellow region stays painted on the canvas
+    /// after the pointer has gone somewhere else entirely.
+    fn connect_hover(self: &Rc<Self>) {
+        let motion = gtk::EventControllerMotion::new();
+
+        let this = self.clone();
+        motion.connect_motion(move |_, x, y| this.hover_quick_select(x, y));
+
+        let this = self.clone();
+        motion.connect_leave(move |_| this.clear_preview());
+
+        self.widget.add_controller(motion);
     }
 
     fn connect_drag(self: &Rc<Self>) {
@@ -333,6 +466,16 @@ impl Canvas {
             CanvasAction::Marquee => {
                 self.state.borrow_mut().gesture =
                     Gesture::Marquee { origin: p, op: MaskOp::from_modifiers(shift, alt) };
+            }
+            CanvasAction::QuickSelect => {
+                // Shift and Alt override the panel's mode for one click, the
+                // same convention the marquees use.
+                let op = if shift || alt {
+                    MaskOp::from_modifiers(shift, alt)
+                } else {
+                    self.state.borrow().quick_select.mode
+                };
+                self.commit_quick_select(p, op);
             }
             CanvasAction::Brush => {
                 self.begin_paint(p, alt);
@@ -515,6 +658,131 @@ impl Canvas {
         self.notify();
     }
 
+    // -- quick selection ----------------------------------------------------
+
+    /// The pixels Quick Selection judges similarity against.
+    ///
+    /// With "Sample all layers" off this is the active layer's own buffer;
+    /// with it on, the composited image, which has to come back off the GPU.
+    /// That readback is why the result is cached: the hover preview runs on
+    /// every pointer move, and reading a full canvas back per move would make
+    /// the tool unusable on anything larger than a thumbnail.
+    fn quick_select_source(&self) -> Option<Rc<PixelBuffer>> {
+        let (all_layers, key) = {
+            let st = self.state.borrow();
+            let all = st.quick_select.sample_all_layers;
+            // A cache key that changes whenever the pixels might have: which
+            // layer is active, how many times any layer has been edited, and
+            // which of the two sources we are reading.
+            let edits: u64 =
+                st.revisions.values().copied().fold(0u64, |a, b| a.wrapping_add(b));
+            let active =
+                st.document.primary_active().map(|id| format!("{id:?}")).unwrap_or_default();
+            (all, format!("{all}|{edits}|{active}|{}", st.document.layers.len()))
+        };
+
+        if let Some((cached_key, buffer)) = &*self.sample_cache.borrow() {
+            if *cached_key == key {
+                return Some(buffer.clone());
+            }
+        }
+
+        let buffer = if all_layers {
+            self.widget.make_current();
+            match self.render_to_buffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("quick selection could not read the composite: {e}");
+                    return None;
+                }
+            }
+        } else {
+            let st = self.state.borrow();
+            let id = st.document.primary_active()?;
+            match st.document.layers.get(id).map(|l| &l.kind) {
+                Some(LayerKind::Pixel { buffer }) => buffer.clone(),
+                // An adjustment or effects layer has no pixels of its own.
+                // Falling back to the composite is more useful than refusing,
+                // and matches what the user is looking at.
+                _ => {
+                    drop(st);
+                    self.widget.make_current();
+                    self.render_to_buffer().ok()?
+                }
+            }
+        };
+
+        let buffer = Rc::new(buffer);
+        *self.sample_cache.borrow_mut() = Some((key, buffer.clone()));
+        Some(buffer)
+    }
+
+    /// The region that would be selected by clicking at `p`.
+    fn quick_select_region(&self, p: glam::Vec2) -> Option<MaskBuffer> {
+        if p.x < 0.0 || p.y < 0.0 {
+            return None;
+        }
+        let (tolerance, reach) = {
+            let st = self.state.borrow();
+            (st.quick_select.tolerance, st.quick_select.reach)
+        };
+        let source = self.quick_select_source()?;
+        let (x, y) = (p.x as u32, p.y as u32);
+        if x >= source.width() || y >= source.height() {
+            return None;
+        }
+        Some(quickselect::grow(
+            &source,
+            (x, y),
+            quickselect::GrowOptions::preview(tolerance, reach),
+        ))
+    }
+
+    /// Update the yellow hover preview for a pointer at `p`.
+    pub fn hover_quick_select(&self, x: f64, y: f64) {
+        let show = {
+            let st = self.state.borrow();
+            canvas_action(st.tool) == CanvasAction::QuickSelect && st.quick_select.show_preview
+        };
+        if !show {
+            self.set_preview_mask(None);
+            return;
+        }
+        let p = self.to_doc(x, y);
+        self.set_preview_mask(self.quick_select_region(p));
+    }
+
+    /// Clear the hover preview — on tool change, on leaving the canvas, and
+    /// after committing. A preview left on screen reads as a real selection.
+    pub fn clear_preview(&self) {
+        self.set_preview_mask(None);
+    }
+
+    fn commit_quick_select(&self, p: glam::Vec2, op: MaskOp) {
+        let Some(region) = self.quick_select_region(p) else { return };
+        {
+            let mut st = self.state.borrow_mut();
+            let (w, h) = (st.document.width, st.document.height);
+            let mut selection =
+                st.document.selection.clone().unwrap_or_else(|| Selection::none(w, h));
+            // Replace starts from nothing, so "New" does not accumulate.
+            if op == MaskOp::Replace {
+                selection = Selection::none(w, h);
+            }
+            selection.combine(&region, if op == MaskOp::Replace { MaskOp::Add } else { op });
+
+            let feather = st.selection_options.feather;
+            if feather > 0.0 {
+                let mut mask = selection.mask().clone();
+                pixelmagic_core::selection::feather(&mut mask, feather);
+                selection = Selection::from_mask(mask);
+            }
+            st.set_selection(selection);
+        }
+        self.clear_preview();
+        self.notify();
+    }
+
     /// Render the document and read it back as a flat image.
     ///
     /// Goes through the same renderer the canvas uses, so an export is exactly
@@ -557,6 +825,72 @@ impl Canvas {
         let hist = gl.renderer.histogram(&target).ok();
         gl.renderer.release(target);
         hist
+    }
+
+    /// Drive the marching ants.
+    ///
+    /// A `GtkWidget` tick callback would be the obvious mechanism and is the
+    /// wrong one: it holds the frame clock open, so the app repaints at the
+    /// display's refresh rate forever, selection or no selection. A timer that
+    /// only asks for a redraw when there is actually an overlay on screen
+    /// costs one closure call every 60ms when idle.
+    ///
+    /// 60ms — about 16fps — is deliberate. Ants are a slow crawl; running them
+    /// at 60fps spends four times the redraws to look no different, and each
+    /// redraw re-renders the whole document.
+    fn start_ant_animation(self: &Rc<Self>) {
+        const INTERVAL_MS: u64 = 60;
+        /// Device pixels per tick. One dash pair is 8px, so a dash takes about
+        /// half a second to travel its own length.
+        const STEP: f32 = 1.0;
+
+        let this = Rc::downgrade(self);
+        glib::timeout_add_local(std::time::Duration::from_millis(INTERVAL_MS), move || {
+            // Weak, so the timer does not keep the canvas — and through it the
+            // whole document — alive after the window is gone.
+            let Some(canvas) = this.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !canvas.has_overlay() || !canvas.widget.is_mapped() {
+                return glib::ControlFlow::Continue;
+            }
+            // Wrap at a multiple of the dash period so the pattern is
+            // continuous across the wrap and the ants do not visibly jump.
+            let next = (canvas.ants_phase.get() + STEP) % 1024.0;
+            canvas.ants_phase.set(next);
+            canvas.widget.queue_render();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Whether anything is on screen that needs animating.
+    fn has_overlay(&self) -> bool {
+        self.state.borrow().document.selection.is_some() || self.preview_mask.borrow().is_some()
+    }
+
+    /// Show what Quick Selection would take if the user clicked now.
+    ///
+    /// Passing `None` clears it — which every path out of the tool must do, or
+    /// a stale yellow region is left painted on the canvas.
+    pub fn set_preview_mask(&self, mask: Option<MaskBuffer>) {
+        let had = self.preview_mask.borrow().is_some();
+        let has = mask.is_some();
+        // Cheap identity check first: recomputing the same region on every
+        // pointer move within one shape is the common case, and re-uploading
+        // it would make the hover stutter on a large fill.
+        let unchanged = match (&*self.preview_mask.borrow(), &mask) {
+            (Some(a), Some(b)) => a.width() == b.width() && a.data() == b.data(),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        *self.preview_mask.borrow_mut() = mask;
+        self.preview_revision.set(self.preview_revision.get().wrapping_add(1));
+        if had || has {
+            self.widget.queue_render();
+        }
     }
 
     /// Tell the canvas where the floating panels are, so it can frost the
@@ -660,6 +994,8 @@ pub enum CanvasAction {
     Marquee,
     /// Stroke with the brush engine.
     Brush,
+    /// Grow a region from the pointer: previews on hover, commits on click.
+    QuickSelect,
     /// Drives the inspector, with no canvas gesture of its own.
     PanelOnly,
     /// Not implemented yet.
@@ -687,6 +1023,8 @@ pub fn canvas_action(tool: Tool) -> CanvasAction {
         Paint | Erase | Sharpen | Soften | Lighten | Darken | Saturate | Desaturate => {
             CanvasAction::Brush
         }
+
+        QuickSelection => CanvasAction::QuickSelect,
 
         ColorAdjustments | Effects => CanvasAction::PanelOnly,
 

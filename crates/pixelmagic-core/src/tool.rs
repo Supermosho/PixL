@@ -5,6 +5,7 @@
 //! type per tool, so the Tools sidebar, the keyboard map and the "what does
 //! this tool actually do yet" status all read from one source.
 
+use crate::buffer::MaskOp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -182,7 +183,7 @@ tools! {
         "Makes selections that intelligently snap to edges in the document";
     ColorSelection "color-select" "Color Selection" Selection None Some('w'), false,
         "Selects similarly colored areas in an image";
-    QuickSelection "quick-select" "Quick Selection" Selection None Some('q'), false,
+    QuickSelection "quick-select" "Quick Selection" Selection None Some('q'), true,
         "Intelligently selects part of an image as you drag over it";
 
     // -- Painting --------------------------------------------------------
@@ -328,6 +329,70 @@ pub fn tools_in(category: ToolCategory) -> impl Iterator<Item = &'static ToolInf
 /// Count of working tools out of the full roster.
 pub fn implemented_count() -> (usize, usize) {
     (TOOLS.iter().filter(|t| t.implemented).count(), TOOLS.len())
+}
+
+// ---------------------------------------------------------------------------
+// Quick Selection settings
+// ---------------------------------------------------------------------------
+
+/// Options for the Quick Selection tool (SPEC §5.14).
+///
+/// One honest departure from the original: `tolerance` is exposed. Pixelmator
+/// hides it, because its region growing is good enough that you rarely need to
+/// reach for it. Ours is a colour flood fill (see
+/// [`crate::quickselect`]), which needs the knob far more often — hiding it
+/// would be copying the interface without the machinery that earns it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QuickSelectSettings {
+    /// How the result combines with the existing selection.
+    pub mode: MaskOp,
+    /// How far the region may spread from the click, in document pixels.
+    /// Named "brush size" in the panel because that is what the original calls
+    /// it and what it behaves like — a bigger brush takes a bigger bite.
+    pub reach: f32,
+    /// Colour distance at which growth stops, 0..1.
+    pub tolerance: f32,
+    /// Sample the composited image rather than just the active layer.
+    pub sample_all_layers: bool,
+    /// Whether to show the yellow hover preview of what would be selected.
+    pub show_preview: bool,
+}
+
+impl Default for QuickSelectSettings {
+    fn default() -> Self {
+        Self {
+            mode: MaskOp::Add,
+            reach: 160.0,
+            tolerance: 0.12,
+            sample_all_layers: false,
+            show_preview: true,
+        }
+    }
+}
+
+impl QuickSelectSettings {
+    /// Smallest and largest reach the panel offers, in document pixels. The
+    /// upper bound is not arbitrary: the hover preview re-runs the fill on
+    /// every pointer move, and the cost is proportional to the area it may
+    /// cover, so this is the knob that keeps hovering interactive.
+    pub const MIN_REACH: f32 = 8.0;
+    pub const MAX_REACH: f32 = 1200.0;
+
+    /// `[` and `]`, matching the brush tools.
+    pub fn step_reach(&mut self, up: bool) {
+        let factor = if up { 1.25 } else { 1.0 / 1.25 };
+        self.reach = (self.reach * factor).clamp(Self::MIN_REACH, Self::MAX_REACH);
+    }
+
+    /// The panel shows reach as a percentage of its range, which is how the
+    /// original presents it.
+    pub fn reach_percent(&self) -> f32 {
+        ((self.reach - Self::MIN_REACH) / (Self::MAX_REACH - Self::MIN_REACH)).clamp(0.0, 1.0)
+    }
+
+    pub fn set_reach_percent(&mut self, t: f32) {
+        self.reach = Self::MIN_REACH + t.clamp(0.0, 1.0) * (Self::MAX_REACH - Self::MIN_REACH);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +616,7 @@ mod tests {
             OvalSelection,
             RowSelection,
             ColumnSelection,
+            QuickSelection,
             Paint,
             Erase,
             Sharpen,
@@ -571,5 +637,42 @@ mod tests {
             "unexpected implemented set: {:?}",
             actual.iter().map(|t| t.label()).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod quick_select_tests {
+    use super::*;
+
+    #[test]
+    fn reach_percent_round_trips() {
+        let mut q = QuickSelectSettings::default();
+        for t in [0.0f32, 0.26, 0.5, 1.0] {
+            q.set_reach_percent(t);
+            assert!(
+                (q.reach_percent() - t).abs() < 1e-4,
+                "{t} came back as {}",
+                q.reach_percent()
+            );
+        }
+    }
+
+    #[test]
+    fn reach_stays_within_its_bounds() {
+        let mut q = QuickSelectSettings::default();
+        for _ in 0..50 {
+            q.step_reach(true);
+        }
+        assert_eq!(q.reach, QuickSelectSettings::MAX_REACH);
+        for _ in 0..200 {
+            q.step_reach(false);
+        }
+        assert_eq!(q.reach, QuickSelectSettings::MIN_REACH);
+
+        // And a percentage outside 0..1 does not escape either.
+        q.set_reach_percent(4.0);
+        assert_eq!(q.reach, QuickSelectSettings::MAX_REACH);
+        q.set_reach_percent(-1.0);
+        assert_eq!(q.reach, QuickSelectSettings::MIN_REACH);
     }
 }

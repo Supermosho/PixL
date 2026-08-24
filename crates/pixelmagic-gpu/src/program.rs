@@ -221,6 +221,7 @@ shader_sources! {
     "composite" => "composite.frag",
     "present" => "present.frag",
     "backdrop" => "backdrop.frag",
+    "selection_overlay" => "selection_overlay.frag",
     "encode_srgb" => "encode_srgb.frag",
     "place" => "place.frag",
     "mask_apply" => "mask_apply.frag",
