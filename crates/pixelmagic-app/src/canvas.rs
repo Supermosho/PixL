@@ -275,8 +275,8 @@ impl Canvas {
             return;
         }
 
-        match tool {
-            Tool::Zoom => {
+        match canvas_action(tool) {
+            CanvasAction::Zoom => {
                 let (w, h) = self.widget_size();
                 let mut st = self.state.borrow_mut();
                 let (dw, dh) = (st.document.width as f32, st.document.height as f32);
@@ -285,20 +285,20 @@ impl Canvas {
                 drop(st);
                 self.queue_redraw();
             }
-            Tool::ColorPicker => {
+            CanvasAction::PickColor => {
                 self.pick_color(p);
             }
-            Tool::Arrange => {
+            CanvasAction::MoveLayer => {
                 self.state.borrow_mut().gesture = Gesture::MoveLayer { last: p };
             }
-            t if t.is_selection() => {
+            CanvasAction::Marquee => {
                 self.state.borrow_mut().gesture =
                     Gesture::Marquee { origin: p, op: MaskOp::from_modifiers(shift, alt) };
             }
-            t if t.needs_pixel_layer() => {
+            CanvasAction::Brush => {
                 self.begin_paint(p, alt);
             }
-            _ => {}
+            CanvasAction::Pan | CanvasAction::PanelOnly | CanvasAction::None => {}
         }
     }
 
@@ -547,6 +547,62 @@ impl Canvas {
     }
 }
 
+/// What a tool actually does when you drag on the canvas.
+///
+/// This is the single source of truth for "does this tool work", and it is
+/// deliberately not a restatement of `ToolInfo::implemented` — it *defines*
+/// it. The two are checked against each other by a test, so a tool cannot be
+/// advertised as working without a dispatch arm here, and a tool cannot gain a
+/// dispatch arm without the rail lighting it up.
+///
+/// The distinction that matters: a tool whose gesture does the *wrong* thing
+/// belongs in `None`, not in a nearby arm. Free Selection routed to the marquee
+/// would drag out a rectangle, which is worse than being greyed out — the user
+/// assumes they are holding it wrong rather than that it is unfinished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasAction {
+    Pan,
+    Zoom,
+    PickColor,
+    MoveLayer,
+    /// Drag out a geometric selection.
+    Marquee,
+    /// Stroke with the brush engine.
+    Brush,
+    /// Drives the inspector, with no canvas gesture of its own.
+    PanelOnly,
+    /// Not implemented yet.
+    None,
+}
+
+pub fn canvas_action(tool: Tool) -> CanvasAction {
+    use Tool::*;
+    match tool {
+        Hand => CanvasAction::Pan,
+        Zoom => CanvasAction::Zoom,
+        ColorPicker => CanvasAction::PickColor,
+        Arrange => CanvasAction::MoveLayer,
+
+        // Only the geometric marquees. The freehand, polygonal, magnetic,
+        // colour and quick selections all need their own gesture and would
+        // otherwise silently draw a rectangle.
+        RectangularSelection | OvalSelection | RowSelection | ColumnSelection => {
+            CanvasAction::Marquee
+        }
+
+        // Only the brush modes `tool_brush_mode` genuinely implements. Color
+        // Fill, Gradient Fill, Smart Erase, Pixel Paint, Smudge, Repair and
+        // Clone would all fall through to an ordinary paint stroke.
+        Paint | Erase | Sharpen | Soften | Lighten | Darken | Saturate | Desaturate => {
+            CanvasAction::Brush
+        }
+
+        ColorAdjustments | Effects => CanvasAction::PanelOnly,
+
+        _ => CanvasAction::None,
+    }
+}
+
 fn tool_brush_mode(tool: Tool) -> BrushMode {
     match tool {
         Tool::Erase => BrushMode::Erase,
@@ -572,6 +628,44 @@ fn stroke_label(tool: Tool) -> String {
 mod tests {
     use super::*;
     use pixelmagic_core::tool::Tool;
+
+    /// Ties the roster's `implemented` flag to the canvas's actual dispatch.
+    ///
+    /// This is the test that stops the app from lying about itself. Marking a
+    /// tool implemented without wiring it up fails here, and so does wiring one
+    /// up without lighting it in the rail.
+    #[test]
+    fn implemented_flag_matches_real_canvas_behaviour() {
+        for info in pixelmagic_core::tool::TOOLS {
+            let has_behaviour = canvas_action(info.tool) != CanvasAction::None;
+            assert_eq!(
+                info.implemented,
+                has_behaviour,
+                "`{}` is marked implemented={} but its canvas action is {:?}",
+                info.label,
+                info.implemented,
+                canvas_action(info.tool),
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_behaviour_counts_as_unimplemented() {
+        // Guards the specific trap: these have a plausible-looking nearby
+        // dispatch arm, and routing them to it would be worse than nothing.
+        for tool in [
+            Tool::FreeSelection,
+            Tool::PolygonalSelection,
+            Tool::ColorSelection,
+            Tool::ColorFill,
+            Tool::GradientFill,
+            Tool::PixelPaint,
+            Tool::Smudge,
+        ] {
+            assert_eq!(canvas_action(tool), CanvasAction::None, "{}", tool.label());
+            assert!(!tool.is_implemented(), "{}", tool.label());
+        }
+    }
 
     #[test]
     fn brush_modes_follow_the_tool() {

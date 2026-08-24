@@ -146,7 +146,7 @@ macro_rules! tools {
 
 tools! {
     // -- Basic -----------------------------------------------------------
-    Style "style" "Style" Basic None Some('s'), true,
+    Style "style" "Style" Basic None Some('s'), false,
         "Add fills, strokes, and shadows to layers";
     Arrange "arrange" "Arrange" Basic None Some('v'), true,
         "Move, rotate, resize, or change the position of layers";
@@ -154,7 +154,7 @@ tools! {
         "Access controls for basic photo editing";
     Effects "effects" "Effects" Basic None Some('f'), true,
         "Add visual effects to your document";
-    Crop "crop" "Crop" Basic None Some('c'), true,
+    Crop "crop" "Crop" Basic None Some('c'), false,
         "Crop and straighten images";
     ExportForWeb "export-for-web" "Export for Web" Basic None Some('k'), false,
         "Prepare and export images for the web";
@@ -174,13 +174,13 @@ tools! {
         "Makes horizontal selections of a custom height and the full width of the canvas";
     ColumnSelection "column-select" "Column Selection" Selection None None, true,
         "Makes vertical selections of a custom width and the full height of the canvas";
-    FreeSelection "free-select" "Free Selection" Selection LassoSelection Some('l'), true,
+    FreeSelection "free-select" "Free Selection" Selection LassoSelection Some('l'), false,
         "Allows you to draw freehand selections";
-    PolygonalSelection "polygonal-select" "Polygonal Selection" Selection LassoSelection None, true,
+    PolygonalSelection "polygonal-select" "Polygonal Selection" Selection LassoSelection None, false,
         "Allows you to draw polygonal, jagged selections";
     MagneticSelection "magnetic-select" "Magnetic Selection" Selection LassoSelection None, false,
         "Makes selections that intelligently snap to edges in the document";
-    ColorSelection "color-select" "Color Selection" Selection None Some('w'), true,
+    ColorSelection "color-select" "Color Selection" Selection None Some('w'), false,
         "Selects similarly colored areas in an image";
     QuickSelection "quick-select" "Quick Selection" Selection None Some('q'), false,
         "Intelligently selects part of an image as you drag over it";
@@ -188,27 +188,27 @@ tools! {
     // -- Painting --------------------------------------------------------
     Paint "paint" "Paint" Painting None Some('b'), true,
         "Paint with a wide array of brushes";
-    PixelPaint "pixel-paint" "Pixel Paint" Painting None None, true,
+    PixelPaint "pixel-paint" "Pixel Paint" Painting None None, false,
         "Paint using square pixel blocks";
-    ColorFill "color-fill" "Color Fill" Painting None Some('n'), true,
+    ColorFill "color-fill" "Color Fill" Painting None Some('n'), false,
         "Fill an entire layer, or part of one, with a solid color";
-    GradientFill "gradient-fill" "Gradient Fill" Painting None Some('g'), true,
+    GradientFill "gradient-fill" "Gradient Fill" Painting None Some('g'), false,
         "Fill an entire layer, or part of one, with a gradient";
     Erase "erase" "Erase" Painting None Some('e'), true,
         "Erase part of an image with brushes";
-    SmartErase "smart-erase" "Smart Erase" Painting None None, true,
+    SmartErase "smart-erase" "Smart Erase" Painting None None, false,
         "Erase similarly colored areas of an image";
 
     // -- Retouching ------------------------------------------------------
     Repair "repair" "Repair" Retouching None Some('r'), false,
         "Remove small parts or entire objects from an image";
-    Clone "clone" "Clone" Retouching None Some('o'), true,
+    Clone "clone" "Clone" Retouching None Some('o'), false,
         "Copy one area of an image to another";
     Sharpen "sharpen-tool" "Sharpen" Retouching None None, true,
         "Sharpen part of an image";
     Soften "soften-tool" "Soften" Retouching None None, true,
         "Soften part of an image";
-    Smudge "smudge" "Smudge" Retouching None None, true,
+    Smudge "smudge" "Smudge" Retouching None None, false,
         "Smudge part of an image like wet paint";
     Lighten "lighten" "Lighten" Retouching None None, true,
         "Make part of an image lighter";
@@ -228,27 +228,27 @@ tools! {
         "Rotate pixels in part of an image to look like a spiral";
 
     // -- Drawing ---------------------------------------------------------
-    Shape "shape" "Shape" Drawing Shapes Some('u'), true,
+    Shape "shape" "Shape" Drawing Shapes Some('u'), false,
         "Add a shape layer";
-    Pen "pen" "Pen" Drawing Pens Some('p'), true,
+    Pen "pen" "Pen" Drawing Pens Some('p'), false,
         "Draw vector lines or shapes by connecting anchor points";
-    FreeformPen "freeform-pen" "Freeform Pen" Drawing Pens None, true,
+    FreeformPen "freeform-pen" "Freeform Pen" Drawing Pens None, false,
         "Draw vector lines or shapes freehand";
-    Rectangle "rectangle" "Rectangle" Drawing Shapes None, true,
+    Rectangle "rectangle" "Rectangle" Drawing Shapes None, false,
         "Add a rectangle";
-    RoundedRectangle "rounded-rectangle" "Rounded Rectangle" Drawing Shapes None, true,
+    RoundedRectangle "rounded-rectangle" "Rounded Rectangle" Drawing Shapes None, false,
         "Add a rounded rectangle";
-    Oval "oval" "Oval" Drawing Shapes None, true,
+    Oval "oval" "Oval" Drawing Shapes None, false,
         "Add an oval";
-    Polygon "polygon" "Polygon" Drawing Shapes None, true,
+    Polygon "polygon" "Polygon" Drawing Shapes None, false,
         "Add a polygon";
-    Star "star" "Star" Drawing Shapes None, true,
+    Star "star" "Star" Drawing Shapes None, false,
         "Add a star";
-    Line "line" "Line" Drawing Shapes None, true,
+    Line "line" "Line" Drawing Shapes None, false,
         "Add a line";
 
     // -- Type ------------------------------------------------------------
-    Type "type" "Type" Type TypeTools Some('t'), true,
+    Type "type" "Type" Type TypeTools Some('t'), false,
         "Add text to a document";
     CircularType "circular-type" "Circular Type" Type TypeTools None, false,
         "Add text on a circular path";
@@ -525,7 +525,51 @@ mod tests {
     fn implementation_status_is_reported() {
         let (done, total) = implemented_count();
         assert_eq!(total, 50);
-        assert!(done > 25, "expected a majority of tools to be wired up");
+        assert!(done > 0);
         assert!(done < total, "the unimplemented ones should still be flagged");
+    }
+
+    /// `implemented` means "selecting this tool lets you do the thing it
+    /// names" — not "there is a code path that runs when you click".
+    ///
+    /// The distinction is the whole point of the flag. A tool that draws a
+    /// rectangle when it claims to draw freehand, or that strokes a brush when
+    /// it claims to fill, is worse than one that is visibly greyed out: the
+    /// user assumes they are holding it wrong. `pixelmagic-app` has a matching
+    /// test that checks this list against the canvas's actual input dispatch.
+    #[test]
+    fn implemented_tools_are_the_ones_with_real_behaviour() {
+        use Tool::*;
+        let expected = [
+            Arrange,
+            ColorAdjustments,
+            Effects,
+            ColorPicker,
+            Zoom,
+            Hand,
+            RectangularSelection,
+            OvalSelection,
+            RowSelection,
+            ColumnSelection,
+            Paint,
+            Erase,
+            Sharpen,
+            Soften,
+            Lighten,
+            Darken,
+            Saturate,
+            Desaturate,
+        ];
+        for tool in expected {
+            assert!(tool.is_implemented(), "{} should be marked implemented", tool.label());
+        }
+        let actual: Vec<Tool> =
+            TOOLS.iter().filter(|t| t.implemented).map(|t| t.tool).collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "unexpected implemented set: {:?}",
+            actual.iter().map(|t| t.label()).collect::<Vec<_>>()
+        );
     }
 }
