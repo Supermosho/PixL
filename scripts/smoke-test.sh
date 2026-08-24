@@ -68,11 +68,54 @@ done
 echo "window $WID mapped"
 sleep 4
 
-xdotool windowactivate "$WID" 2>/dev/null
-xdotool windowfocus "$WID" 2>/dev/null
-sleep 1
+# Getting keystrokes into the app under Xvfb takes more care than it looks.
+# There is no window manager, so `windowactivate` fails and X input focus has
+# to be set by hand; and `xdotool key --window` is *not* a substitute, because
+# it uses XSendEvent and GTK4 ignores synthetic key events. Setting focus once
+# is not enough either — it does not stick until the window is viewable — so
+# this retries until X agrees, and gives up loudly rather than running the rest
+# of the script against a window that cannot hear it.
+focus_app() {
+    for _ in $(seq 1 15); do
+        xdotool windowactivate "$WID" 2>/dev/null
+        xdotool windowfocus "$WID" 2>/dev/null
+        # Click the canvas too, so the key controller on the window sees the
+        # event rather than a focused header button swallowing it.
+        xdotool mousemove 700 520 click 1 2>/dev/null
+        sleep 1
+        [ "$(xdotool getwindowfocus 2>/dev/null)" = "$WID" ] && return 0
+    done
+    return 1
+}
+
+if ! focus_app; then
+    echo "FAIL: could not give the window keyboard focus; keystroke checks would be meaningless"
+    exit 1
+fi
+echo "window has keyboard focus"
 
 shot() { sleep 2; import -window root "$OUT/$1.png" 2>/dev/null; echo "  captured $1"; }
+
+# Capturing a screenshot proves the app did not crash; it does not prove the
+# thing we asked for happened. `changed` fails when two frames are identical,
+# which is what a keystroke that went nowhere looks like.
+FAILURES=0
+changed() {
+    local a="$OUT/$1.png" b="$OUT/$2.png"
+    local sa sb
+    sa=$(identify -quiet -format "%#" "$a" 2>/dev/null)
+    sb=$(identify -quiet -format "%#" "$b" 2>/dev/null)
+    if [ -z "$sa" ] || [ -z "$sb" ]; then
+        echo "  ?? could not hash $1/$2, skipping the check"
+        return
+    fi
+    if [ "$sa" = "$sb" ]; then
+        echo "  FAIL: $3 (frames $1 and $2 are identical)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "  ok: $3"
+    fi
+}
 
 shot 01-open
 
@@ -81,9 +124,12 @@ echo "== tool shortcuts and panels =="
 # the app that uses a compute shader and a storage-buffer readback. It is
 # therefore the step that exercises the GL/GLES entry points the headless tests
 # (desktop GL only) cannot reach.
-xdotool key --window "$WID" a; shot 02-adjustments
-xdotool key --window "$WID" f; shot 03-effects
-xdotool key --window "$WID" b; shot 04-paint-tool
+xdotool key a; shot 02-adjustments
+changed 01-open 02-adjustments "'a' opened the Color Adjustments panel"
+xdotool key f; shot 03-effects
+changed 02-adjustments 03-effects "'f' opened the Effects panel"
+xdotool key b; shot 04-paint-tool
+changed 03-effects 04-paint-tool "'b' selected the Paint tool"
 
 echo "== painting =="
 xdotool mousemove 300 380 mousedown 1
@@ -95,17 +141,18 @@ xdotool mouseup 1
 shot 05-painted
 
 echo "== undo =="
-xdotool key --window "$WID" ctrl+z; shot 06-undone
+xdotool key ctrl+z; shot 06-undone
+changed 05-painted 06-undone "Ctrl+Z undid the stroke"
 
 echo "== selection tool =="
-xdotool key --window "$WID" m
+xdotool key m
 xdotool mousemove 250 300 mousedown 1
 xdotool mousemove 550 550
 xdotool mouseup 1
 shot 07-selection
 
 echo "== zoom =="
-xdotool key --window "$WID" ctrl+0; shot 08-zoom-fit
+xdotool key ctrl+0; shot 08-zoom-fit
 
 kill $APP 2>/dev/null
 wait $APP 2>/dev/null
@@ -125,6 +172,11 @@ fi
 if grep -qiE 'No provider of' "$OUT/app.log"; then
     echo "FAIL: the app called a GL entry point this context does not have"
     grep -A3 -i 'No provider of' "$OUT/app.log"
+    exit 1
+fi
+
+if [ "$FAILURES" -gt 0 ]; then
+    echo "FAIL: $FAILURES interaction check(s) did not change anything on screen"
     exit 1
 fi
 

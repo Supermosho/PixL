@@ -806,3 +806,116 @@ fn histogram_of_an_empty_document_is_empty() {
     assert!(h.is_empty());
     assert_eq!(h.peak(0), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Frosted-glass backdrop
+// ---------------------------------------------------------------------------
+
+/// The backdrop pass has to blur what is *already in the framebuffer*, which
+/// means a framebuffer-to-framebuffer blit and an alpha-blended draw — two
+/// things the rest of the renderer never does, and two things drivers disagree
+/// about. Checking it by eye in the running app catches "it looks frosted";
+/// only this catches "the frosting samples the wrong region" or "the blend
+/// leaves the panel fully opaque".
+#[test]
+fn backdrop_blurs_only_inside_its_rectangle() {
+    use pixelmagic_gpu::renderer::{BackdropRect, BackdropStyle};
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    // A hard black/white split down the middle. Blurring it smears grey across
+    // the seam, which is trivially distinguishable from not blurring it.
+    let (w, h) = (128u32, 128u32);
+    let mut buffer = PixelBuffer::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let v = if x < w / 2 { 0.0 } else { 1.0 };
+            buffer.set(x, y, Rgba::new(v, v, v, 1.0));
+        }
+    }
+    let mut doc = Document::empty(w, h);
+    doc.layers.insert("split", LayerKind::Pixel { buffer }, None);
+
+    let revisions: HashMap<LayerId, u64> = HashMap::new();
+    let image = renderer.render_document(&doc, &revisions).unwrap();
+
+    // Present into an 8-bit scratch target, which stands in for the widget's
+    // framebuffer, then frost the left half of it.
+    let scratch = renderer.acquire_rgba8(w, h).unwrap();
+    scratch.bind();
+    renderer
+        .present(&image, (0, 0, w as i32, h as i32), false, Some(scratch.framebuffer()))
+        .unwrap();
+    renderer.release(image);
+
+    let rect = BackdropRect { x: 0.0, y: 0.0, width: (w / 2) as f32, height: h as f32 };
+    let style = BackdropStyle {
+        radius: 24.0,
+        scale: 1,
+        corner: 0.0,
+        // No tint, so the test measures the blur and nothing else.
+        tint: [0.0, 0.0, 0.0, 0.0],
+        opacity: 1.0,
+    };
+    renderer
+        .blur_backdrop((w as i32, h as i32), &[rect], style, Some(scratch.framebuffer()))
+        .unwrap();
+
+    let px = scratch.read_rgba8().unwrap();
+    renderer.release(scratch);
+
+    let mid = h / 2;
+    // Just inside the frosted rectangle, hard by the black/white seam: the
+    // blur must have pulled white across, so this is no longer black.
+    let inside = pixel_at(&px, w, w / 2 - 2, mid);
+    assert!(
+        inside[0] > 40,
+        "expected the blur to lighten the edge of the frosted region, got {inside:?}"
+    );
+
+    // Well inside the frosted rectangle and far from the seam, still black:
+    // the blur is finite, so it must not have washed out the whole panel.
+    let deep = pixel_at(&px, w, 4, mid);
+    assert!(deep[0] < 40, "the blur reached far past its radius: {deep:?}");
+
+    // Outside the rectangle, untouched — the same distance from the seam as
+    // `inside`, so any smearing there would be the pass ignoring its bounds.
+    let outside = pixel_at(&px, w, w / 2 + 2, mid);
+    assert!(outside[0] > 200, "the backdrop pass drew outside its rectangle, got {outside:?}");
+}
+
+/// An empty rectangle list must be a no-op, not a blank frame. The app calls
+/// this on every render, including the ones before the panels have been laid
+/// out and measured.
+#[test]
+fn backdrop_with_no_rectangles_leaves_the_frame_alone() {
+    use pixelmagic_gpu::renderer::BackdropStyle;
+    gl_test!(ctx);
+    let mut renderer = Renderer::new(ctx.gl.clone(), ctx.flavor).unwrap();
+
+    let (w, h) = (32u32, 32u32);
+    let doc = solid_doc(w, h, &[(Rgba::new(1.0, 0.0, 0.0, 1.0), BlendMode::Normal, 1.0)]);
+    let revisions: HashMap<LayerId, u64> = HashMap::new();
+    let image = renderer.render_document(&doc, &revisions).unwrap();
+
+    let scratch = renderer.acquire_rgba8(w, h).unwrap();
+    scratch.bind();
+    renderer
+        .present(&image, (0, 0, w as i32, h as i32), false, Some(scratch.framebuffer()))
+        .unwrap();
+    renderer.release(image);
+
+    renderer
+        .blur_backdrop(
+            (w as i32, h as i32),
+            &[],
+            BackdropStyle::default(),
+            Some(scratch.framebuffer()),
+        )
+        .unwrap();
+
+    let px = scratch.read_rgba8().unwrap();
+    renderer.release(scratch);
+    let c = pixel_at(&px, w, w / 2, h / 2);
+    assert!(c[0] > 200 && c[1] < 40, "the no-op path changed the frame: {c:?}");
+}

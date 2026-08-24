@@ -204,36 +204,35 @@ pub fn from_gdk(c: gtk::gdk::RGBA) -> pixelmagic_core::color::Rgba {
 }
 
 // ---------------------------------------------------------------------------
-// Tools sidebar
+// Tool rail
 // ---------------------------------------------------------------------------
 
-pub struct ToolsSidebar {
+/// The vertical strip of tool buttons.
+///
+/// In the original this sits on the **far right**, outboard of the tool's own
+/// options panel — not on the left where Photoshop and GIMP put it.
+pub struct ToolRail {
     pub widget: gtk::Box,
     buttons: RefCell<Vec<(Tool, gtk::ToggleButton)>>,
-    /// Set while the sidebar is syncing itself to the current tool, so the
-    /// `toggled` signals that causes do not read as user clicks and bounce
-    /// straight back into the state that produced them.
+    /// Set while syncing to the current tool, so the `toggled` signals that
+    /// causes are not mistaken for user clicks.
     updating: std::cell::Cell<bool>,
 }
 
-impl ToolsSidebar {
+impl ToolRail {
     pub fn new(
         state: Rc<RefCell<EditorState>>,
         on_select: impl Fn(Tool) + 'static,
     ) -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.add_css_class("tools-sidebar");
-        widget.set_width_request(56);
+        widget.add_css_class("pm-rail");
+        widget.set_width_request(crate::style::metrics::RAIL_WIDTH);
 
-        let scroller = gtk::ScrolledWindow::new();
-        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        scroller.set_vexpand(true);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list.set_margin_top(2);
+        list.set_margin_bottom(2);
 
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        list.set_margin_top(6);
-        list.set_margin_bottom(6);
-
-        let sidebar = Rc::new(ToolsSidebar {
+        let rail = Rc::new(ToolRail {
             widget: widget.clone(),
             buttons: RefCell::new(Vec::new()),
             updating: std::cell::Cell::new(false),
@@ -243,15 +242,14 @@ impl ToolsSidebar {
         for (i, category) in ToolCategory::ALL.iter().enumerate() {
             if i > 0 {
                 let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
-                sep.set_margin_top(4);
-                sep.set_margin_bottom(4);
-                sep.set_margin_start(10);
-                sep.set_margin_end(10);
+                sep.set_margin_top(3);
+                sep.set_margin_bottom(3);
+                sep.set_margin_start(9);
+                sep.set_margin_end(9);
                 list.append(&sep);
             }
             for info in tools_in(*category) {
                 let button = gtk::ToggleButton::new();
-                button.add_css_class("flat");
                 button.add_css_class("tool-button");
                 button.set_child(Some(&gtk::Label::new(Some(&tool_glyph(info.tool)))));
 
@@ -259,45 +257,43 @@ impl ToolsSidebar {
                     .shortcut
                     .map(|c| format!("  ({})", c.to_ascii_uppercase()))
                     .unwrap_or_default();
-                let status = if info.implemented { "" } else { "  — not implemented yet" };
+                let status = if info.implemented { "" } else { "\n\nNot implemented yet" };
                 button.set_tooltip_text(Some(&format!(
                     "{}{shortcut}\n{}{status}",
                     info.label, info.description
                 )));
-                // Tools without an implementation stay visible but inert, so the
-                // roster reads as a roadmap rather than a set of traps.
                 button.set_sensitive(info.implemented);
 
                 let tool = info.tool;
                 let on_select = on_select.clone();
-                let sidebar_weak = Rc::downgrade(&sidebar);
+                let rail_weak = Rc::downgrade(&rail);
                 button.connect_toggled(move |b| {
-                    let Some(sidebar) = sidebar_weak.upgrade() else { return };
-                    if sidebar.updating.get() || !b.is_active() {
+                    let Some(rail) = rail_weak.upgrade() else { return };
+                    if rail.updating.get() || !b.is_active() {
                         return;
                     }
-                    sidebar.set_active_silently(tool);
+                    rail.set_active_silently(tool);
                     on_select(tool);
                 });
 
-                sidebar.buttons.borrow_mut().push((tool, button.clone()));
+                rail.buttons.borrow_mut().push((tool, button.clone()));
                 list.append(&button);
             }
         }
 
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroller.set_propagate_natural_height(true);
         scroller.set_child(Some(&list));
         widget.append(&scroller);
 
         let current = state.borrow().tool;
-        sidebar.set_active_silently(current);
-        sidebar
+        rail.set_active_silently(current);
+        rail
     }
 
     /// Update which button looks active without re-firing `on_select`.
     pub fn set_active_silently(&self, tool: Tool) {
-        // `set_active` emits `toggled` synchronously; the guard flag is what
-        // stops that turning into an infinite ping-pong between the sidebar and
-        // the editor state.
         let was = self.updating.replace(true);
         for (t, b) in self.buttons.borrow().iter() {
             let should = *t == tool;
@@ -311,21 +307,26 @@ impl ToolsSidebar {
 
 /// A short glyph for each tool.
 ///
-/// Deliberately typographic rather than iconographic: Pixelmagic does not ship
-/// Apple's icon set, and inventing 50 pictograms is a design project of its
-/// own. Letters and symbols are honest placeholders that stay legible.
+/// Typographic rather than iconographic, and deliberately so: Pixelmagic does
+/// not ship Apple's icon set, and inventing fifty pictograms is a design
+/// project of its own. Letters and symbols are honest placeholders that stay
+/// legible at rail size.
 fn tool_glyph(tool: Tool) -> String {
     use Tool::*;
+    // Strictly monochrome. Anything in the emoji planes (a hand, a paintbrush,
+    // a bucket) renders as a full-colour glyph, which looks badly out of place
+    // in a grey rail and cannot be tinted to show the active state.
     match tool {
         Style => "◆",
-        Arrange => "✥",
+        Arrange => "➤",
         ColorAdjustments => "◐",
         Effects => "✦",
         Crop => "⌗",
         ExportForWeb => "⤓",
         ColorPicker => "⌖",
         Zoom => "⌕",
-        Hand => "✋",
+        Hand => "⎈",
+
         RectangularSelection => "▭",
         OvalSelection => "◯",
         RowSelection => "▬",
@@ -335,25 +336,28 @@ fn tool_glyph(tool: Tool) -> String {
         MagneticSelection => "⌁",
         ColorSelection => "◍",
         QuickSelection => "⌾",
-        Paint => "🖌",
+
+        Paint => "✏",
         PixelPaint => "▦",
-        ColorFill => "🪣",
+        ColorFill => "◧",
         GradientFill => "▤",
         Erase => "◻",
         SmartErase => "⌫",
+
         Repair => "✚",
         Clone => "⎘",
         Sharpen => "△",
         Soften => "◠",
         Smudge => "≈",
-        Lighten => "☀",
-        Darken => "☾",
+        Lighten => "⊕",
+        Darken => "⊖",
         Saturate => "◉",
         Desaturate => "○",
         Distort => "∿",
         Bump => "◗",
         Pinch => "◖",
-        Twirl => "🌀",
+        Twirl => "⊚",
+
         Shape => "⬟",
         Pen => "✒",
         FreeformPen => "✎",
@@ -363,43 +367,74 @@ fn tool_glyph(tool: Tool) -> String {
         Polygon => "⬡",
         Star => "★",
         Line => "╱",
+
         Type => "T",
         CircularType => "◜",
         PathType => "⌇",
-        FreeformType => "⌁",
+        FreeformType => "≀",
     }
     .to_string()
 }
 
 // ---------------------------------------------------------------------------
-// Layers sidebar
+// Layers panel
 // ---------------------------------------------------------------------------
 
 pub struct LayersSidebar {
     pub widget: gtk::Box,
     list: gtk::ListBox,
     opacity: gtk::Scale,
+    opacity_value: gtk::Label,
     blend: gtk::DropDown,
+    search: gtk::SearchEntry,
     state: Rc<RefCell<EditorState>>,
     on_change: RefCell<Vec<Rc<dyn Fn()>>>,
-    /// Set while rebuilding, so programmatic changes do not look like user
-    /// input and write themselves back into the document.
+    /// Set while rebuilding, so programmatic changes are not mistaken for user
+    /// input and written back into the document.
     updating: std::cell::Cell<bool>,
 }
 
 impl LayersSidebar {
     pub fn new(state: Rc<RefCell<EditorState>>) -> Rc<Self> {
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        widget.add_css_class("layers-sidebar");
-        widget.set_width_request(260);
-        widget.set_margin_top(6);
-        widget.set_margin_bottom(6);
-        widget.set_margin_start(6);
-        widget.set_margin_end(6);
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-        // Blend mode and opacity sit above the list, as they do in the
-        // original: they apply to the selected layer, not to the document.
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // -- header: title and the three action buttons ----------------------
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        header.add_css_class("pm-panel-header");
+        let title = gtk::Label::new(Some("Layers"));
+        title.add_css_class("pm-panel-title");
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        header.append(&title);
+
+        for (icon, tooltip, action) in [
+            ("list-add-symbolic", "New layer", "win.layer-new"),
+            ("edit-copy-symbolic", "Duplicate layer", "win.layer-duplicate"),
+        ] {
+            let b = gtk::Button::from_icon_name(icon);
+            b.add_css_class("flat");
+            b.set_tooltip_text(Some(tooltip));
+            b.set_action_name(Some(action));
+            header.append(&b);
+        }
+        let more = gtk::MenuButton::new();
+        more.set_icon_name("view-more-symbolic");
+        more.add_css_class("flat");
+        let more_menu = gtk::gio::Menu::new();
+        more_menu.append(Some("Group Layers"), Some("win.layer-group"));
+        more_menu.append(Some("Delete Layer"), Some("win.layer-delete"));
+        more_menu.append(Some("Color Adjustments Layer"), Some("win.layer-adjustments"));
+        more_menu.append(Some("Effects Layer"), Some("win.layer-effects"));
+        more.set_menu_model(Some(&more_menu));
+        header.append(&more);
+        widget.append(&header);
+
+        // -- blend mode and opacity, applying to the selected layer ----------
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        controls.set_margin_start(10);
+        controls.set_margin_end(10);
+        controls.set_margin_bottom(6);
+
         let blend_model = gtk::StringList::new(&[]);
         for group in BlendGroup::ALL {
             for mode in BlendMode::ALL.iter().filter(|m| m.group() == group) {
@@ -407,39 +442,59 @@ impl LayersSidebar {
             }
         }
         let blend = gtk::DropDown::new(Some(blend_model), gtk::Expression::NONE);
-        blend.set_hexpand(true);
-        header.append(&blend);
+        blend.set_size_request(112, -1);
+        blend.set_valign(gtk::Align::Center);
+        controls.append(&blend);
 
-        let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
-        opacity.set_value(100.0);
-        opacity.set_hexpand(true);
-        opacity.set_draw_value(true);
-        opacity.set_value_pos(gtk::PositionType::Right);
-
-        let opacity_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let opacity_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        opacity_col.set_hexpand(true);
+        let opacity_head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let opacity_label = gtk::Label::new(Some("Opacity"));
         opacity_label.set_xalign(0.0);
-        opacity_row.append(&opacity_label);
-        opacity_row.append(&opacity);
+        opacity_label.set_hexpand(true);
+        let opacity_value = gtk::Label::new(Some("100%"));
+        opacity_value.set_xalign(1.0);
+        opacity_head.append(&opacity_label);
+        opacity_head.append(&opacity_value);
 
+        let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+        opacity.add_css_class("pm-opacity");
+        opacity.set_value(100.0);
+        opacity.set_draw_value(false);
+
+        opacity_col.append(&opacity_head);
+        opacity_col.append(&opacity);
+        controls.append(&opacity_col);
+        widget.append(&controls);
+
+        // -- the list --------------------------------------------------------
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
-        list.add_css_class("navigation-sidebar");
+        // Deliberately *not* `.background`: that libadwaita class paints the
+        // opaque window colour, which covers the frosted backdrop the renderer
+        // draws under this panel and turns the bottom two-thirds of it into a
+        // black rectangle. The stylesheet makes it transparent instead.
+        list.add_css_class("pm-layer-list");
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
-
-        widget.append(&header);
-        widget.append(&opacity_row);
         widget.append(&scroller);
+
+        // -- search, along the bottom edge ------------------------------------
+        let search = gtk::SearchEntry::new();
+        search.add_css_class("pm-search");
+        search.set_placeholder_text(Some("Search"));
+        widget.append(&search);
 
         let sidebar = Rc::new(LayersSidebar {
             widget,
             list: list.clone(),
             opacity: opacity.clone(),
+            opacity_value,
             blend: blend.clone(),
+            search: search.clone(),
             state: state.clone(),
             on_change: RefCell::new(Vec::new()),
             updating: std::cell::Cell::new(false),
@@ -452,20 +507,21 @@ impl LayersSidebar {
                     return;
                 }
                 let Some(row) = row else { return };
-                let index = row.index();
-                let ids: Vec<LayerId> = s
-                    .state
-                    .borrow()
-                    .document
-                    .layers
-                    .iter_depth_first()
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-                if let Some(id) = ids.get(index as usize) {
-                    s.state.borrow_mut().document.set_active(vec![*id]);
-                }
+                let Some(id) = s.visible_layers().get(row.index() as usize).copied() else {
+                    return;
+                };
+                s.state.borrow_mut().document.set_active(vec![id]);
                 s.notify();
+            });
+        }
+
+        {
+            let s = sidebar.clone();
+            search.connect_search_changed(move |_| {
+                if s.updating.get() {
+                    return;
+                }
+                s.refresh();
             });
         }
 
@@ -476,17 +532,18 @@ impl LayersSidebar {
                     return;
                 }
                 let value = (sc.value() / 100.0) as f32;
-                let st = s.state.borrow_mut();
-                if let Some(id) = st.document.primary_active() {
-                    let edit = pixelmagic_core::history::SetLayerProperty::new(
+                let st = s.state.borrow();
+                let edit = st.document.primary_active().and_then(|id| {
+                    pixelmagic_core::history::SetLayerProperty::new(
                         &st.document,
                         id,
                         pixelmagic_core::history::LayerProperty::Opacity(value),
-                    );
-                    if let Ok(edit) = edit {
-                        drop(st);
-                        s.state.borrow_mut().apply(Box::new(edit));
-                    }
+                    )
+                    .ok()
+                });
+                drop(st);
+                if let Some(edit) = edit {
+                    s.state.borrow_mut().apply(Box::new(edit));
                 }
                 s.notify();
             });
@@ -501,17 +558,18 @@ impl LayersSidebar {
                 let Some(mode) = BlendMode::ALL.get(d.selected() as usize).copied() else {
                     return;
                 };
-                let st = s.state.borrow_mut();
-                if let Some(id) = st.document.primary_active() {
-                    let edit = pixelmagic_core::history::SetLayerProperty::new(
+                let st = s.state.borrow();
+                let edit = st.document.primary_active().and_then(|id| {
+                    pixelmagic_core::history::SetLayerProperty::new(
                         &st.document,
                         id,
                         pixelmagic_core::history::LayerProperty::Blend(mode),
-                    );
-                    if let Ok(edit) = edit {
-                        drop(st);
-                        s.state.borrow_mut().apply(Box::new(edit));
-                    }
+                    )
+                    .ok()
+                });
+                drop(st);
+                if let Some(edit) = edit {
+                    s.state.borrow_mut().apply(Box::new(edit));
                 }
                 s.notify();
             });
@@ -532,6 +590,28 @@ impl LayersSidebar {
         }
     }
 
+    /// Layer ids currently shown, honouring the search filter — the mapping
+    /// from row index back to layer.
+    fn visible_layers(&self) -> Vec<LayerId> {
+        let needle = self.search.text().to_lowercase();
+        let st = self.state.borrow();
+        st.document
+            .layers
+            .iter_depth_first()
+            .into_iter()
+            .filter(|(id, _)| {
+                needle.is_empty()
+                    || st
+                        .document
+                        .layers
+                        .get(*id)
+                        .map(|l| l.name.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// Rebuild the list from the document.
     pub fn refresh(&self) {
         self.updating.set(true);
@@ -540,45 +620,38 @@ impl LayersSidebar {
             self.list.remove(&child);
         }
 
+        let visible = self.visible_layers();
         let st = self.state.borrow();
-        let entries = st.document.layers.iter_depth_first();
+        let depths: std::collections::HashMap<LayerId, usize> =
+            st.document.layers.iter_depth_first().into_iter().collect();
         let active = st.document.primary_active();
         let mut active_index = None;
 
-        for (index, (id, depth)) in entries.iter().enumerate() {
+        for (index, id) in visible.iter().enumerate() {
             let Some(layer) = st.document.layers.get(*id) else { continue };
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.set_margin_start(6 + *depth as i32 * 14);
-            row.set_margin_end(6);
-            row.set_margin_top(3);
-            row.set_margin_bottom(3);
+            let depth = depths.get(id).copied().unwrap_or(0);
 
-            let eye = gtk::CheckButton::new();
-            eye.set_active(layer.visible);
-            eye.set_tooltip_text(Some("Show or hide this layer"));
-            {
-                let state = self.state.clone();
-                let id = *id;
-                eye.connect_toggled(move |b| {
-                    let mut st = state.borrow_mut();
-                    if let Some(l) = st.document.layers.get_mut(id) {
-                        l.visible = b.is_active();
-                        st.document.dirty = true;
-                        st.needs_redraw = true;
-                    }
-                });
-            }
-            row.append(&eye);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.add_css_class("pm-layer-row");
+            row.set_margin_start(6 + depth as i32 * 14);
 
-            let kind = gtk::Label::new(Some(kind_glyph(&layer.kind)));
-            kind.set_tooltip_text(Some(layer.kind.type_label()));
-            row.append(&kind);
+            row.append(&build_thumbnail(layer));
 
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            text.set_valign(gtk::Align::Center);
+            text.set_hexpand(true);
             let name = gtk::Label::new(Some(&layer.name));
+            name.add_css_class("pm-layer-name");
             name.set_xalign(0.0);
-            name.set_hexpand(true);
             name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            row.append(&name);
+            text.append(&name);
+
+            let meta = gtk::Label::new(Some(&layer_meta(layer)));
+            meta.add_css_class("pm-layer-meta");
+            meta.set_xalign(0.0);
+            meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.append(&meta);
+            row.append(&text);
 
             if let Some(tag) = layer.color_tag.color() {
                 let swatch = gtk::DrawingArea::new();
@@ -591,10 +664,32 @@ impl LayersSidebar {
                 });
                 row.append(&swatch);
             }
-
             if layer.locked {
-                row.append(&gtk::Label::new(Some("🔒")));
+                let lock = gtk::Label::new(Some("🔒"));
+                lock.set_valign(gtk::Align::Center);
+                row.append(&lock);
             }
+
+            let eye = gtk::CheckButton::new();
+            eye.add_css_class("pm-visible");
+            eye.set_active(layer.visible);
+            eye.set_valign(gtk::Align::Center);
+            eye.set_tooltip_text(Some("Show or hide this layer"));
+            {
+                let state = self.state.clone();
+                let id = *id;
+                eye.connect_toggled(move |b| {
+                    let mut st = state.borrow_mut();
+                    if let Some(l) = st.document.layers.get_mut(id) {
+                        if l.visible != b.is_active() {
+                            l.visible = b.is_active();
+                            st.document.dirty = true;
+                            st.needs_redraw = true;
+                        }
+                    }
+                });
+            }
+            row.append(&eye);
 
             let list_row = gtk::ListBoxRow::new();
             list_row.set_child(Some(&row));
@@ -611,20 +706,88 @@ impl LayersSidebar {
             }
         }
 
-        // Reflect the active layer's own settings in the header controls.
         if let Some(layer) = st.document.active_layer() {
             self.opacity.set_value((layer.opacity * 100.0) as f64);
+            self.opacity_value.set_text(&format!("{:.0}%", layer.opacity * 100.0));
             self.blend.set_selected(layer.blend_mode.shader_index());
             self.opacity.set_sensitive(true);
             self.blend.set_sensitive(true);
         } else {
             self.opacity.set_sensitive(false);
             self.blend.set_sensitive(false);
+            self.opacity_value.set_text("—");
         }
 
         drop(st);
         self.updating.set(false);
     }
+}
+
+/// The line under a layer's name: its pixel dimensions, or its kind for the
+/// layers that have none.
+fn layer_meta(layer: &pixelmagic_core::layer::Layer) -> String {
+    match &layer.kind {
+        LayerKind::Pixel { buffer } if !buffer.is_empty() => {
+            format!("{} × {} px", buffer.width(), buffer.height())
+        }
+        other => other.type_label().to_string(),
+    }
+}
+
+/// A small preview of the layer's content.
+///
+/// Built by point-sampling the layer's buffer rather than filtering it. A
+/// thumbnail is 32 px; the difference between a box filter and nearest
+/// neighbour is invisible at that size, and point sampling costs nothing even
+/// for a 24-megapixel layer.
+fn build_thumbnail(layer: &pixelmagic_core::layer::Layer) -> gtk::Widget {
+    const SIZE: u32 = 32;
+
+    let picture = gtk::Picture::new();
+    picture.set_size_request(SIZE as i32, SIZE as i32);
+    picture.add_css_class("pm-thumb");
+    picture.set_valign(gtk::Align::Center);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+
+    if let LayerKind::Pixel { buffer } = &layer.kind {
+        if !buffer.is_empty() {
+            let (sw, sh) = (buffer.width(), buffer.height());
+            let scale = (sw.max(sh) as f32 / SIZE as f32).max(1.0);
+            let (tw, th) = (
+                ((sw as f32 / scale).round() as u32).max(1),
+                ((sh as f32 / scale).round() as u32).max(1),
+            );
+
+            let mut data = Vec::with_capacity((tw * th * 4) as usize);
+            for y in 0..th {
+                for x in 0..tw {
+                    let sx = ((x as f32 + 0.5) * scale) as u32;
+                    let sy = ((y as f32 + 0.5) * scale) as u32;
+                    let c = buffer
+                        .get(sx.min(sw - 1), sy.min(sh - 1))
+                        .unwrap_or(pixelmagic_core::color::Rgba::TRANSPARENT);
+                    data.extend_from_slice(&c.to_u8());
+                }
+            }
+
+            let texture = gtk::gdk::MemoryTexture::new(
+                tw as i32,
+                th as i32,
+                gtk::gdk::MemoryFormat::R8g8b8a8,
+                &gtk::glib::Bytes::from_owned(data),
+                (tw * 4) as usize,
+            );
+            picture.set_paintable(Some(&texture));
+            return picture.upcast();
+        }
+    }
+
+    // Non-pixel layers get their type glyph instead of an image.
+    let label = gtk::Label::new(Some(kind_glyph(&layer.kind)));
+    label.add_css_class("pm-thumb");
+    label.set_size_request(SIZE as i32, SIZE as i32);
+    label.set_valign(gtk::Align::Center);
+    label.upcast()
 }
 
 fn kind_glyph(kind: &LayerKind) -> &'static str {
@@ -637,6 +800,517 @@ fn kind_glyph(kind: &LayerKind) -> &'static str {
         LayerKind::Effects => "✦",
         LayerKind::Video { .. } => "▶",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arrange panel
+// ---------------------------------------------------------------------------
+
+/// The Arrange tool's options: ordering, alignment, size, position, rotation
+/// and the layer-level commands.
+///
+/// This is the densest panel in the original and the one that makes the window
+/// look like an image editor rather than a viewer. Controls that are not backed
+/// by working code are present but insensitive, with a tooltip saying so —
+/// leaving them out entirely would misrepresent the shape of the tool, and
+/// leaving them live would misrepresent what it does.
+pub fn build_arrange_panel(
+    state: Rc<RefCell<EditorState>>,
+    on_change: Rc<dyn Fn()>,
+) -> gtk::Widget {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.set_margin_start(8);
+    outer.set_margin_end(8);
+    outer.set_margin_bottom(10);
+    outer.set_vexpand(true);
+
+    let has_layer = state.borrow().document.primary_active().is_some();
+
+    // -- stacking order ------------------------------------------------------
+    //
+    // Two rows of two rather than one row of four. A horizontal `GtkBox`
+    // reports the *sum* of its children's minimum widths as its own, and
+    // `set_propagate_natural_width(false)` on the enclosing scroller does not
+    // suppress that — so "Back Front Backward Forward" on one line silently
+    // widened the whole options panel past its 272px and shoved it over the
+    // canvas. Anything added here has to survive that constraint.
+    let mut order_row: Option<gtk::Box> = None;
+    for (index, (label, delta)) in
+        [("Back", i32::MAX), ("Front", i32::MIN), ("Backward", 1), ("Forward", -1)]
+            .into_iter()
+            .enumerate()
+    {
+        let row = match (index % 2, order_row.clone()) {
+            (0, _) | (_, None) => {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                row.set_homogeneous(true);
+                row.set_margin_bottom(4);
+                outer.append(&row);
+                order_row = Some(row.clone());
+                row
+            }
+            (_, Some(row)) => row,
+        };
+
+        let b = gtk::Button::with_label(label);
+        b.set_sensitive(has_layer);
+        let state = state.clone();
+        let on_change = on_change.clone();
+        b.connect_clicked(move |_| {
+            {
+                let mut st = state.borrow_mut();
+                if let Some(id) = st.document.primary_active() {
+                    // Root order is front-most first, so "Front" means index 0.
+                    let _ = st.document.layers.reorder(id, delta as isize);
+                    st.document.dirty = true;
+                    st.needs_redraw = true;
+                }
+            }
+            on_change();
+        });
+        row.append(&b);
+    }
+    if let Some(row) = order_row {
+        row.set_margin_bottom(8);
+    }
+
+    // -- alignment, against the canvas ---------------------------------------
+    outer.append(&section_label("Align"));
+    for row_spec in [
+        [("⤒", Align::Top), ("⇕", Align::VCenter), ("⤓", Align::Bottom)],
+        [("⇤", Align::Left), ("⇔", Align::HCenter), ("⇥", Align::Right)],
+    ] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        row.set_homogeneous(true);
+        row.set_margin_bottom(4);
+        for (glyph, align) in row_spec {
+            let b = gtk::Button::with_label(glyph);
+            b.set_tooltip_text(Some(align.tooltip()));
+            b.set_sensitive(has_layer);
+            let state = state.clone();
+            let on_change = on_change.clone();
+            b.connect_clicked(move |_| {
+                align_active_layer(&state, align);
+                on_change();
+            });
+            row.append(&b);
+        }
+        outer.append(&row);
+    }
+
+    // -- size ----------------------------------------------------------------
+    let geom = active_geometry(&state);
+    outer.append(&section_label("Size"));
+
+    let constrain = gtk::CheckButton::with_label("Constrain proportions");
+    constrain.set_active(true);
+    let constrain_flag = Rc::new(std::cell::Cell::new(true));
+    {
+        let flag = constrain_flag.clone();
+        constrain.connect_toggled(move |b| flag.set(b.is_active()));
+    }
+
+    let (size_row, width_spin, height_spin) = paired_spins(
+        "W:",
+        "H:",
+        geom.map(|g| g.width).unwrap_or(0.0),
+        geom.map(|g| g.height).unwrap_or(0.0),
+        1.0,
+        20000.0,
+    );
+    size_row.set_sensitive(has_layer);
+    outer.append(&size_row);
+    outer.append(&constrain);
+
+    let original = gtk::Button::with_label("Original Size");
+    original.set_margin_top(4);
+    original.set_sensitive(has_layer);
+    {
+        let state = state.clone();
+        let on_change = on_change.clone();
+        original.connect_clicked(move |_| {
+            with_active_transform(&state, |d| {
+                d.scale = glam::Vec2::new(d.scale.x.signum(), d.scale.y.signum());
+            });
+            on_change();
+        });
+    }
+    outer.append(&original);
+
+    // Wiring the two spins after both exist, so each can read the other for the
+    // constrain-proportions case.
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        let (flag, other) = (constrain_flag.clone(), height_spin.clone());
+        let base = geom;
+        width_spin.connect_value_changed(move |sb| {
+            let Some(base) = base else { return };
+            let ratio = sb.value() as f32 / base.width.max(1e-3);
+            with_active_transform(&state, |d| {
+                d.scale.x = ratio * d.scale.x.signum() * base.scale.x.abs()
+                    / base.scale.x.abs().max(1e-6);
+                d.scale.x = ratio * base.scale.x.signum();
+                if flag.get() {
+                    d.scale.y = ratio * base.scale.y.signum();
+                }
+            });
+            if flag.get() {
+                other.set_value((base.height * ratio) as f64);
+            }
+            on_change();
+        });
+    }
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        let (flag, other) = (constrain_flag.clone(), width_spin.clone());
+        let base = geom;
+        height_spin.connect_value_changed(move |sb| {
+            let Some(base) = base else { return };
+            let ratio = sb.value() as f32 / base.height.max(1e-3);
+            with_active_transform(&state, |d| {
+                d.scale.y = ratio * base.scale.y.signum();
+                if flag.get() {
+                    d.scale.x = ratio * base.scale.x.signum();
+                }
+            });
+            if flag.get() {
+                other.set_value((base.width * ratio) as f64);
+            }
+            on_change();
+        });
+    }
+
+    // -- position ------------------------------------------------------------
+    outer.append(&section_label("Position"));
+    let (pos_row, x_spin, y_spin) = paired_spins(
+        "X:",
+        "Y:",
+        geom.map(|g| g.x).unwrap_or(0.0),
+        geom.map(|g| g.y).unwrap_or(0.0),
+        -20000.0,
+        20000.0,
+    );
+    pos_row.set_sensitive(has_layer);
+    outer.append(&pos_row);
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        x_spin.connect_value_changed(move |sb| {
+            let v = sb.value() as f32;
+            with_active_transform(&state, |d| d.translation.x = v);
+            on_change();
+        });
+    }
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        y_spin.connect_value_changed(move |sb| {
+            let v = sb.value() as f32;
+            with_active_transform(&state, |d| d.translation.y = v);
+            on_change();
+        });
+    }
+
+    // -- rotate and flip -----------------------------------------------------
+    outer.append(&section_label("Rotate"));
+    let rotate_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    rotate_row.set_sensitive(has_layer);
+
+    let angle = gtk::SpinButton::with_range(-360.0, 360.0, 1.0);
+    angle.set_hexpand(true);
+    angle.set_value(geom.map(|g| g.rotation_degrees as f64).unwrap_or(0.0));
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        angle.connect_value_changed(move |sb| {
+            let radians = (sb.value() as f32).to_radians();
+            with_active_transform(&state, |d| d.rotation = radians);
+            on_change();
+        });
+    }
+    rotate_row.append(&angle);
+
+    for (glyph, tip, horizontal) in
+        [("⇋", "Flip horizontally", true), ("⇅", "Flip vertically", false)]
+    {
+        let b = gtk::Button::with_label(glyph);
+        b.set_tooltip_text(Some(tip));
+        let state = state.clone();
+        let on_change = on_change.clone();
+        b.connect_clicked(move |_| {
+            with_active_transform(&state, |d| {
+                if horizontal {
+                    d.scale.x = -d.scale.x;
+                } else {
+                    d.scale.y = -d.scale.y;
+                }
+            });
+            on_change();
+        });
+        rotate_row.append(&b);
+    }
+    outer.append(&rotate_row);
+
+    // -- layer commands ------------------------------------------------------
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_margin_top(10);
+    outer.append(&spacer);
+
+    let locked = state.borrow().document.active_layer().map(|l| l.locked).unwrap_or(false);
+    let visible = state.borrow().document.active_layer().map(|l| l.visible).unwrap_or(true);
+
+    outer.append(&button_pair(
+        ("Lock", has_layer && !locked, {
+            let (state, on_change) = (state.clone(), on_change.clone());
+            Box::new(move || {
+                set_layer_locked(&state, true);
+                on_change();
+            }) as Box<dyn Fn()>
+        }),
+        ("Unlock", has_layer && locked, {
+            let (state, on_change) = (state.clone(), on_change.clone());
+            Box::new(move || {
+                set_layer_locked(&state, false);
+                on_change();
+            })
+        }),
+    ));
+
+    outer.append(&button_pair(
+        ("Hide", has_layer && visible, {
+            let (state, on_change) = (state.clone(), on_change.clone());
+            Box::new(move || {
+                set_layer_visible(&state, false);
+                on_change();
+            }) as Box<dyn Fn()>
+        }),
+        ("Show", has_layer && !visible, {
+            let (state, on_change) = (state.clone(), on_change.clone());
+            Box::new(move || {
+                set_layer_visible(&state, true);
+                on_change();
+            })
+        }),
+    ));
+
+    let group_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    group_row.set_homogeneous(true);
+    group_row.set_margin_top(8);
+    let group = gtk::Button::with_label("Group");
+    group.set_action_name(Some("win.layer-group"));
+    group.set_sensitive(has_layer);
+    let ungroup = gtk::Button::with_label("Ungroup");
+    ungroup.set_sensitive(
+        state.borrow().document.active_layer().map(|l| l.is_group()).unwrap_or(false),
+    );
+    {
+        let (state, on_change) = (state.clone(), on_change.clone());
+        ungroup.connect_clicked(move |_| {
+            {
+                let mut st = state.borrow_mut();
+                if let Some(id) = st.document.primary_active() {
+                    let _ = st.document.layers.ungroup(id);
+                    st.document.prune_active();
+                    st.document.dirty = true;
+                    st.needs_redraw = true;
+                }
+            }
+            on_change();
+        });
+    }
+    group_row.append(&group);
+    group_row.append(&ungroup);
+    outer.append(&group_row);
+
+    for (label, why) in [
+        ("Merge Layers", "Merging is not implemented yet"),
+        ("Transform…", "Free transform is not implemented yet"),
+        ("Warp…", "Warp is not implemented yet"),
+    ] {
+        let b = gtk::Button::with_label(label);
+        b.set_margin_top(6);
+        b.set_sensitive(false);
+        b.set_tooltip_text(Some(why));
+        outer.append(&b);
+    }
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_propagate_natural_width(false);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&outer));
+    scroller.upcast()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    HCenter,
+    Right,
+    Top,
+    VCenter,
+    Bottom,
+}
+
+impl Align {
+    fn tooltip(self) -> &'static str {
+        match self {
+            Align::Left => "Align left edge to the canvas",
+            Align::HCenter => "Centre horizontally in the canvas",
+            Align::Right => "Align right edge to the canvas",
+            Align::Top => "Align top edge to the canvas",
+            Align::VCenter => "Centre vertically in the canvas",
+            Align::Bottom => "Align bottom edge to the canvas",
+        }
+    }
+}
+
+/// The active layer's placement, as the panel displays it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Geometry {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    rotation_degrees: f32,
+    scale: glam::Vec2,
+}
+
+fn active_geometry(state: &Rc<RefCell<EditorState>>) -> Option<Geometry> {
+    let st = state.borrow();
+    let layer = st.document.active_layer()?;
+    let local = layer.local_bounds();
+    let d = layer.transform.decompose();
+    Some(Geometry {
+        x: d.translation.x,
+        y: d.translation.y,
+        width: local.width * d.scale.x.abs(),
+        height: local.height * d.scale.y.abs(),
+        rotation_degrees: d.rotation.to_degrees(),
+        scale: d.scale,
+    })
+}
+
+/// Edit the active layer's transform through its decomposition.
+fn with_active_transform(
+    state: &Rc<RefCell<EditorState>>,
+    f: impl FnOnce(&mut pixelmagic_core::geom::Decomposed),
+) {
+    let mut st = state.borrow_mut();
+    let Some(id) = st.document.primary_active() else { return };
+    let Some(layer) = st.document.layers.get_mut(id) else { return };
+    if layer.locked {
+        return;
+    }
+    let mut d = layer.transform.decompose();
+    f(&mut d);
+    layer.transform = pixelmagic_core::geom::Transform::compose(d);
+    st.document.dirty = true;
+    st.needs_redraw = true;
+}
+
+fn align_active_layer(state: &Rc<RefCell<EditorState>>, align: Align) {
+    let (canvas_w, canvas_h) = {
+        let st = state.borrow();
+        (st.document.width as f32, st.document.height as f32)
+    };
+    let Some(g) = active_geometry(state) else { return };
+    with_active_transform(state, |d| match align {
+        Align::Left => d.translation.x = 0.0,
+        Align::HCenter => d.translation.x = (canvas_w - g.width) * 0.5,
+        Align::Right => d.translation.x = canvas_w - g.width,
+        Align::Top => d.translation.y = 0.0,
+        Align::VCenter => d.translation.y = (canvas_h - g.height) * 0.5,
+        Align::Bottom => d.translation.y = canvas_h - g.height,
+    });
+}
+
+fn set_layer_locked(state: &Rc<RefCell<EditorState>>, locked: bool) {
+    let st = state.borrow();
+    let edit = st.document.primary_active().and_then(|id| {
+        pixelmagic_core::history::SetLayerProperty::new(
+            &st.document,
+            id,
+            pixelmagic_core::history::LayerProperty::Locked(locked),
+        )
+        .ok()
+    });
+    drop(st);
+    if let Some(edit) = edit {
+        state.borrow_mut().apply(Box::new(edit));
+    }
+}
+
+fn set_layer_visible(state: &Rc<RefCell<EditorState>>, visible: bool) {
+    let st = state.borrow();
+    let edit = st.document.primary_active().and_then(|id| {
+        pixelmagic_core::history::SetLayerProperty::new(
+            &st.document,
+            id,
+            pixelmagic_core::history::LayerProperty::Visible(visible),
+        )
+        .ok()
+    });
+    drop(st);
+    if let Some(edit) = edit {
+        state.borrow_mut().apply(Box::new(edit));
+    }
+}
+
+fn section_label(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.add_css_class("pm-section");
+    l.set_xalign(0.0);
+    l.set_margin_top(10);
+    l.set_margin_bottom(4);
+    l
+}
+
+/// Two labelled spin buttons side by side, as in the Size and Position rows.
+fn paired_spins(
+    a_label: &str,
+    b_label: &str,
+    a_value: f32,
+    b_value: f32,
+    min: f64,
+    max: f64,
+) -> (gtk::Box, gtk::SpinButton, gtk::SpinButton) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let mut spins = Vec::new();
+    for (label, value) in [(a_label, a_value), (b_label, b_value)] {
+        let cell = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        cell.set_hexpand(true);
+        let l = gtk::Label::new(Some(label));
+        l.set_xalign(0.0);
+        let spin = gtk::SpinButton::with_range(min, max, 1.0);
+        spin.set_hexpand(true);
+        // A `GtkSpinButton`'s minimum width is its character count plus the
+        // stepper buttons, and two of these side by side set the minimum width
+        // of the whole options panel: at six characters each the panel came out
+        // 44px over budget and sat on top of the canvas. Three is the floor;
+        // `max_width_chars` lets it show a five-digit dimension whenever there
+        // is room, which at the panel's real width there is.
+        spin.set_width_chars(3);
+        spin.set_max_width_chars(7);
+        // Value set before the handler is connected, so populating the panel
+        // does not look like the user typing into it.
+        spin.set_value(value as f64);
+        cell.append(&l);
+        cell.append(&spin);
+        row.append(&cell);
+        spins.push(spin);
+    }
+    (row, spins[0].clone(), spins[1].clone())
+}
+
+fn button_pair(a: (&str, bool, Box<dyn Fn()>), b: (&str, bool, Box<dyn Fn()>)) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    row.set_homogeneous(true);
+    row.set_margin_top(4);
+    for (label, sensitive, action) in [a, b] {
+        let button = gtk::Button::with_label(label);
+        button.set_sensitive(sensitive);
+        button.connect_clicked(move |_| action());
+        row.append(&button);
+    }
+    row
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +1331,7 @@ pub fn build_histogram(hist: Option<pixelmagic_gpu::renderer::Histogram>) -> gtk
     let area = gtk::DrawingArea::new();
     area.set_content_height(96);
     area.set_hexpand(true);
-    area.add_css_class("histogram");
+    area.add_css_class("pm-histogram");
 
     area.set_draw_func(move |_, cr, w, h| {
         let (w, h) = (w as f64, h as f64);
@@ -750,11 +1424,6 @@ pub fn build_adjustments_panel(
     outer.set_margin_bottom(8);
     outer.set_margin_start(8);
     outer.set_margin_end(8);
-
-    let heading = gtk::Label::new(Some("Color Adjustments"));
-    heading.add_css_class("title-4");
-    heading.set_xalign(0.0);
-    outer.append(&heading);
 
     let pixels = histogram.as_ref().map(|h| h.total).unwrap_or(0);
     outer.append(&build_histogram(histogram));
@@ -865,11 +1534,6 @@ pub fn build_effects_panel(
     outer.set_margin_start(8);
     outer.set_margin_end(8);
 
-    let heading = gtk::Label::new(Some("Effects"));
-    heading.add_css_class("title-4");
-    heading.set_xalign(0.0);
-    outer.append(&heading);
-
     let (done, total) = pixelmagic_core::effect::implemented_count();
     let status = gtk::Label::new(Some(&format!("{done} of {total} effects implemented")));
     status.set_xalign(0.0);
@@ -933,11 +1597,6 @@ pub fn build_tool_options(
     outer.set_margin_end(8);
 
     let tool = state.borrow().tool;
-    let heading = gtk::Label::new(Some(tool.label()));
-    heading.add_css_class("title-4");
-    heading.set_xalign(0.0);
-    outer.append(&heading);
-
     let description = gtk::Label::new(Some(tool.info().description));
     description.set_xalign(0.0);
     description.set_wrap(true);

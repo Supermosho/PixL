@@ -260,6 +260,12 @@ impl RenderTarget {
         self.texture.height
     }
 
+    /// The underlying framebuffer, for the rare caller that needs to bind it
+    /// as a *read* or *draw* target separately — a blit, for instance.
+    pub fn framebuffer(&self) -> glow::Framebuffer {
+        self.fbo
+    }
+
     /// Make this the active render target and set the viewport to match.
     pub fn bind(&self) {
         unsafe {

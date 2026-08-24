@@ -56,6 +56,48 @@ pub struct FrameStats {
     pub dispatches: usize,
 }
 
+/// A panel rectangle to frost, in top-left-origin widget pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackdropRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// How the frosted-glass backdrop looks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackdropStyle {
+    /// Blur radius in widget pixels, before downscaling.
+    pub radius: f32,
+    /// Downsample factor for the blur. Larger is cheaper and, at these radii,
+    /// indistinguishable.
+    pub scale: u32,
+    /// Corner radius in widget pixels. Must match the panel's CSS, or the
+    /// frosting and the border will trace different curves.
+    pub corner: f32,
+    /// Panel colour and how much of it covers the blurred backdrop.
+    pub tint: [f32; 4],
+    /// Overall strength, so the whole effect can be turned down or off.
+    pub opacity: f32,
+}
+
+impl Default for BackdropStyle {
+    fn default() -> Self {
+        Self {
+            radius: 64.0,
+            scale: 4,
+            corner: 10.0,
+            // Grey of `--pm-panel-bg`, at the share of the tint this layer
+            // is responsible for. The stylesheet paints the rest on top, and
+            // the two together leave roughly a quarter of the blurred canvas
+            // showing — enough to read as glass, not enough to fight the text.
+            tint: [0.172, 0.172, 0.180, 0.50],
+            opacity: 1.0,
+        }
+    }
+}
+
 /// A 256-bin histogram of the composited image.
 ///
 /// Channels are red, green, blue and luminance, binned on **encoded** sRGB
@@ -1385,6 +1427,110 @@ impl Renderer {
         self.draw_quad();
         self.stats.passes += 1;
         Ok(())
+    }
+
+    /// Blur the framebuffer behind a set of rectangles, in place.
+    ///
+    /// This is the frosted-glass effect under the floating panels. It has to
+    /// happen here rather than in the toolkit: GTK4 has no `backdrop-filter`,
+    /// and a translucent widget just shows the pixels underneath unaltered.
+    /// The GNOME "Blur My Shell" extension does not reach it either — that
+    /// blurs what is behind a *window*, and this is compositing inside one.
+    ///
+    /// Rectangles are in top-left-origin widget pixels, matching how the UI
+    /// lays panels out; the conversion to GL's bottom-left origin happens here
+    /// so no caller has to think about it. Call it after [`Renderer::present`]
+    /// and before GTK draws the panel widgets over the top.
+    ///
+    /// `scale` divides the snapshot before blurring — 4 means a quarter-size
+    /// blur, which is invisible at these radii and sixteen times cheaper.
+    pub fn blur_backdrop(
+        &mut self,
+        widget: (i32, i32),
+        rects: &[BackdropRect],
+        style: BackdropStyle,
+        target: Option<glow::Framebuffer>,
+    ) -> Result<()> {
+        use glow::HasContext;
+
+        let (fw, fh) = widget;
+        if rects.is_empty() || fw <= 0 || fh <= 0 || style.opacity <= 0.0 {
+            return Ok(());
+        }
+
+        let scale = style.scale.max(1);
+        let (sw, sh) = ((fw as u32 / scale).max(1), (fh as u32 / scale).max(1));
+
+        // Snapshot what has been drawn so far. `blit_framebuffer` rather than
+        // `copy_tex_sub_image_2d` because only the blit can rescale, and doing
+        // the downsample here means the blur never touches full resolution.
+        let snapshot = self.pool.acquire(sw, sh, Format::Rgba8)?;
+        unsafe {
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, target);
+            self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(snapshot.framebuffer()));
+            self.gl.blit_framebuffer(
+                0,
+                0,
+                fw,
+                fh,
+                0,
+                0,
+                sw as i32,
+                sh as i32,
+                glow::COLOR_BUFFER_BIT,
+                glow::LINEAR,
+            );
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, target);
+        }
+
+        // The radius is in widget pixels, so it shrinks with the snapshot.
+        let blurred = self.blur(&snapshot, (style.radius / scale as f32).max(0.5))?;
+        self.pool.release(snapshot);
+
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, target);
+            self.gl.viewport(0, 0, fw, fh);
+            self.gl.enable(glow::BLEND);
+            // Premultiplied source, which is what the shader writes.
+            self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        }
+
+        let handle = blurred.texture.handle();
+        for rect in rects {
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                continue;
+            }
+            let p = self.shaders.get("backdrop")?;
+            p.bind();
+            p.set_texture("u_image", 0, handle);
+            p.set_vec2("u_resolution", [fw as f32, fh as f32]);
+            p.set_vec4(
+                "u_rect",
+                [
+                    rect.x,
+                    // Top-left origin in, bottom-left origin out.
+                    fh as f32 - rect.y - rect.height,
+                    rect.width,
+                    rect.height,
+                ],
+            );
+            p.set_f32("u_corner", style.corner);
+            p.set_vec4("u_tint", style.tint);
+            p.set_f32("u_opacity", style.opacity);
+            self.draw_quad();
+            self.stats.passes += 1;
+        }
+
+        unsafe { self.gl.disable(glow::BLEND) };
+        self.pool.release(blurred);
+        Ok(())
+    }
+
+    /// An 8-bit target from the pool, for a caller that needs somewhere to
+    /// present into that behaves like the window's framebuffer. Tests use this
+    /// to stand in for the one GTK owns.
+    pub fn acquire_rgba8(&mut self, width: u32, height: u32) -> Result<RenderTarget> {
+        self.pool.acquire(width, height, Format::Rgba8)
     }
 
     pub fn release(&mut self, target: RenderTarget) {

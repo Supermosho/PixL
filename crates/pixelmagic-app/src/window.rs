@@ -1,4 +1,16 @@
-//! The main window: layout, actions and shortcuts.
+//! The main window.
+//!
+//! ## Layout
+//!
+//! The original is a dark canvas with floating panels laid over it, and the
+//! arrangement is specific: Layers on the **left**, the active tool's options on
+//! the **right**, and the tool rail on the **far right**, outboard of them.
+//! Pixelmagic originally had the rail on the left and layers on the right —
+//! the GIMP/Photoshop convention, and not this one.
+//!
+//! Floating means a `GtkOverlay`, not a `GtkPaned`. Panes give you dividers and
+//! flush edges; these panels sit *above* the canvas with a margin, rounded
+//! corners and a shadow, and the canvas runs full-bleed underneath them.
 
 use adw::prelude::*;
 use gtk::gio;
@@ -12,9 +24,13 @@ use std::rc::Rc;
 
 use crate::canvas::Canvas;
 use crate::state::EditorState;
+use crate::style::metrics;
+
+/// Height of the info strip, which the document should not sit under.
+const STATUS_HEIGHT: i32 = 22;
 use crate::ui::{
-    build_adjustments_panel, build_effects_panel, build_tool_options, LayersSidebar,
-    ToolsSidebar,
+    build_adjustments_panel, build_arrange_panel, build_effects_panel, build_tool_options,
+    LayersSidebar, ToolRail,
 };
 
 pub struct Window {
@@ -22,11 +38,18 @@ pub struct Window {
     state: Rc<RefCell<EditorState>>,
     canvas: Rc<Canvas>,
     layers: Rc<LayersSidebar>,
-    tools: Rc<ToolsSidebar>,
-    /// The right-hand pane, rebuilt when the active tool changes.
-    inspector: gtk::Box,
+    rail: Rc<ToolRail>,
+    /// Body of the right-hand panel, rebuilt when the active tool changes.
+    options_body: gtk::Box,
+    options_title: gtk::Label,
+    layers_panel: gtk::Box,
+    options_panel: gtk::Box,
     status: gtk::Label,
-    title: adw::WindowTitle,
+    title: gtk::Label,
+    subtitle: gtk::Label,
+    zoom: gtk::Scale,
+    /// Guards the zoom slider against writing back the value we just set on it.
+    syncing: std::cell::Cell<bool>,
 }
 
 impl Window {
@@ -34,154 +57,153 @@ impl Window {
         let state = EditorState::shared(document);
         let canvas = Canvas::new(state.clone());
         let layers = LayersSidebar::new(state.clone());
-
-        let title = adw::WindowTitle::new("Pixelmagic", "");
-        let header = adw::HeaderBar::new();
-        header.set_title_widget(Some(&title));
+        let rail = ToolRail::new(state.clone(), {
+            let state = state.clone();
+            move |tool| state.borrow_mut().tool = tool
+        });
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(1440)
-            .default_height(900)
+            .default_width(1600)
+            .default_height(1000)
             .title("Pixelmagic")
             .build();
+        window.add_css_class("pixelmagic");
 
-        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        inspector.set_size_request(320, -1);
-        // Without this the inspector grows to whatever its widest panel wants
-        // and steals the canvas's space.
-        inspector.set_hexpand(false);
+        // -- toolbar ---------------------------------------------------------
+        let header = adw::HeaderBar::new();
+        header.add_css_class("pm-toolbar");
+        // Window controls on the left, as in the original. The buttons stay
+        // GTK's own — drawing macOS traffic lights inside a GTK app would look
+        // alien on a Linux desktop and would ignore the user's preference,
+        // which belongs to their window manager.
+        header.set_decoration_layout(Some("close,minimize,maximize:"));
 
-        let tools_holder: Rc<RefCell<Option<Rc<ToolsSidebar>>>> = Rc::new(RefCell::new(None));
-        let tools = ToolsSidebar::new(state.clone(), {
-            let state = state.clone();
-            move |tool| {
-                state.borrow_mut().tool = tool;
-            }
-        });
-        *tools_holder.borrow_mut() = Some(tools.clone());
+        let title = gtk::Label::new(Some("Untitled"));
+        title.add_css_class("pm-doc-title");
+        let subtitle = gtk::Label::new(Some(""));
+        subtitle.add_css_class("pm-doc-subtitle");
+        let title_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        title_box.set_valign(gtk::Align::Center);
+        title_box.append(&title);
+        title_box.append(&subtitle);
+        header.set_title_widget(Some(&title_box));
+
+        let sidebar_toggle = gtk::Button::from_icon_name("sidebar-show-symbolic");
+        sidebar_toggle.add_css_class("flat");
+        sidebar_toggle.set_tooltip_text(Some("Show or hide the Layers panel"));
+        header.pack_start(&sidebar_toggle);
+
+        let (zoom_box, zoom) = build_zoom_control();
+        header.pack_start(&zoom_box);
+
+        let menu_button = gtk::MenuButton::new();
+        menu_button.set_icon_name("view-more-symbolic");
+        menu_button.add_css_class("flat");
+        menu_button.set_menu_model(Some(&build_menu()));
+        header.pack_end(&menu_button);
+
+        let share = gtk::Button::from_icon_name("document-send-symbolic");
+        share.add_css_class("flat");
+        share.set_tooltip_text(Some("Export…  (Ctrl+E)"));
+        share.set_action_name(Some("win.export"));
+        header.pack_end(&share);
+
+        let info = gtk::Button::from_icon_name("dialog-information-symbolic");
+        info.add_css_class("flat");
+        info.set_tooltip_text(Some("About Pixelmagic"));
+        info.set_action_name(Some("win.about"));
+        header.pack_end(&info);
+
+        // -- floating panels -------------------------------------------------
+        let layers_panel = panel_shell(&layers.widget);
+        layers_panel.set_size_request(metrics::LAYERS_WIDTH, -1);
+        layers_panel.set_halign(gtk::Align::Start);
+        layers_panel.set_valign(gtk::Align::Fill);
+        set_margins(&layers_panel, metrics::PANEL_MARGIN);
+
+        let options_title = gtk::Label::new(Some("Arrange"));
+        options_title.add_css_class("pm-panel-title");
+        options_title.set_xalign(0.0);
+        let options_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        options_body.set_vexpand(true);
+
+        let options_inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        head.add_css_class("pm-panel-header");
+        head.append(&options_title);
+        options_inner.append(&head);
+        options_inner.append(&options_body);
+
+        let options_panel = panel_shell(&options_inner);
+        options_panel.set_size_request(metrics::OPTIONS_WIDTH, -1);
+        options_panel.set_halign(gtk::Align::End);
+        options_panel.set_valign(gtk::Align::Fill);
+        set_margins(&options_panel, metrics::PANEL_MARGIN);
+        // Sits inboard of the rail rather than underneath it.
+        options_panel.set_margin_end(metrics::RAIL_WIDTH + metrics::PANEL_MARGIN * 2);
+
+        rail.widget.set_halign(gtk::Align::End);
+        rail.widget.set_valign(gtk::Align::Center);
+        set_margins(&rail.widget, metrics::PANEL_MARGIN);
 
         let status = gtk::Label::new(Some(""));
+        status.add_css_class("pm-status");
         status.set_xalign(0.0);
-        status.add_css_class("dim-label");
-        status.set_margin_start(10);
-        status.set_margin_end(10);
-        status.set_margin_top(3);
-        status.set_margin_bottom(3);
+        status.set_halign(gtk::Align::Start);
+        status.set_valign(gtk::Align::End);
+        status.set_margin_start(metrics::LAYERS_WIDTH + metrics::PANEL_MARGIN * 2);
 
-        // Left rail, canvas, right inspector; a slim info bar underneath.
-        let centre = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        centre.append(&tools.widget);
-        centre.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        centre.append(&canvas.widget);
-        centre.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        centre.append(&inspector);
-
-        let right_split = gtk::Paned::new(gtk::Orientation::Vertical);
-        right_split.set_start_child(Some(&centre));
-        right_split.set_resize_start_child(true);
-        right_split.set_shrink_start_child(false);
-
-        let bottom = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        bottom.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        bottom.append(&status);
-        right_split.set_end_child(Some(&bottom));
-        right_split.set_resize_end_child(false);
-        right_split.set_shrink_end_child(false);
-
-        // The layers sidebar is a separate pane so it can be resized.
-        let main_split = gtk::Paned::new(gtk::Orientation::Horizontal);
-        main_split.set_start_child(Some(&right_split));
-        main_split.set_end_child(Some(&layers.widget));
-        main_split.set_resize_start_child(true);
-        main_split.set_shrink_start_child(false);
-        main_split.set_resize_end_child(false);
+        let overlay = gtk::Overlay::new();
+        overlay.set_vexpand(true);
+        overlay.add_css_class("main-area");
+        overlay.set_child(Some(&canvas.widget));
+        overlay.add_overlay(&status);
+        overlay.add_overlay(&layers_panel);
+        overlay.add_overlay(&options_panel);
+        overlay.add_overlay(&rail.widget);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
-        content.append(&main_split);
+        content.append(&overlay);
         window.set_content(Some(&content));
 
         let win = Rc::new(Window {
-            window: window.clone(),
+            window,
             state,
-            canvas: canvas.clone(),
-            layers: layers.clone(),
-            tools,
-            inspector,
+            canvas,
+            layers,
+            rail,
+            options_body,
+            options_title,
+            layers_panel: layers_panel.clone(),
+            options_panel: options_panel.clone(),
             status,
             title,
+            subtitle,
+            zoom,
+            syncing: std::cell::Cell::new(false),
         });
 
-        win.build_header(&header);
+        {
+            let win = win.clone();
+            sidebar_toggle.connect_clicked(move |_| {
+                let visible = !win.layers_panel.is_visible();
+                win.layers_panel.set_visible(visible);
+                win.status.set_margin_start(if visible {
+                    metrics::LAYERS_WIDTH + metrics::PANEL_MARGIN * 2
+                } else {
+                    metrics::PANEL_MARGIN * 2
+                });
+                win.sync_insets();
+                win.sync_backdrops_soon();
+            });
+        }
+
         win.wire_up();
         win.refresh();
+        win.sync_backdrops_soon();
         win
-    }
-
-    fn build_header(self: &Rc<Self>, header: &adw::HeaderBar) {
-        let new_button = gtk::Button::from_icon_name("document-new-symbolic");
-        new_button.set_tooltip_text(Some("New document  (Ctrl+N)"));
-        new_button.set_action_name(Some("win.new"));
-        header.pack_start(&new_button);
-
-        let open_button = gtk::Button::from_icon_name("document-open-symbolic");
-        open_button.set_tooltip_text(Some("Open  (Ctrl+O)"));
-        open_button.set_action_name(Some("win.open"));
-        header.pack_start(&open_button);
-
-        let save_button = gtk::Button::from_icon_name("document-save-symbolic");
-        save_button.set_tooltip_text(Some("Save  (Ctrl+S)"));
-        save_button.set_action_name(Some("win.save"));
-        header.pack_start(&save_button);
-
-        let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
-        undo.set_tooltip_text(Some("Undo  (Ctrl+Z)"));
-        undo.set_action_name(Some("win.undo"));
-        header.pack_start(&undo);
-
-        let redo = gtk::Button::from_icon_name("edit-redo-symbolic");
-        redo.set_tooltip_text(Some("Redo  (Ctrl+Shift+Z)"));
-        redo.set_action_name(Some("win.redo"));
-        header.pack_start(&redo);
-
-        let export = gtk::Button::with_label("Export…");
-        export.set_action_name(Some("win.export"));
-        header.pack_end(&export);
-
-        let menu = gio::Menu::new();
-
-        let layer_section = gio::Menu::new();
-        layer_section.append(Some("New Layer"), Some("win.layer-new"));
-        layer_section.append(Some("Duplicate Layer"), Some("win.layer-duplicate"));
-        layer_section.append(Some("Delete Layer"), Some("win.layer-delete"));
-        layer_section.append(Some("Group Layers"), Some("win.layer-group"));
-        menu.append_section(Some("Layer"), &layer_section);
-
-        let add_section = gio::Menu::new();
-        add_section.append(Some("Color Adjustments Layer"), Some("win.layer-adjustments"));
-        add_section.append(Some("Effects Layer"), Some("win.layer-effects"));
-        menu.append_section(Some("Add"), &add_section);
-
-        let view_section = gio::Menu::new();
-        view_section.append(Some("Zoom to Fit"), Some("win.zoom-fit"));
-        view_section.append(Some("Actual Size"), Some("win.zoom-actual"));
-        view_section.append(Some("Zoom In"), Some("win.zoom-in"));
-        view_section.append(Some("Zoom Out"), Some("win.zoom-out"));
-        menu.append_section(Some("View"), &view_section);
-
-        let select_section = gio::Menu::new();
-        select_section.append(Some("Select All"), Some("win.select-all"));
-        select_section.append(Some("Deselect"), Some("win.deselect"));
-        select_section.append(Some("Invert Selection"), Some("win.select-invert"));
-        menu.append_section(Some("Select"), &select_section);
-
-        menu.append(Some("About Pixelmagic"), Some("win.about"));
-
-        let button = gtk::MenuButton::new();
-        button.set_icon_name("open-menu-symbolic");
-        button.set_menu_model(Some(&menu));
-        header.pack_end(&button);
     }
 
     fn wire_up(self: &Rc<Self>) {
@@ -193,53 +215,150 @@ impl Window {
             let win = self.clone();
             self.layers.connect_changed(move || win.refresh());
         }
+        {
+            let win = self.clone();
+            self.zoom.connect_value_changed(move |s| {
+                if win.syncing.get() {
+                    return;
+                }
+                let zoom = 2f32.powf(s.value() as f32);
+                win.canvas.set_zoom(zoom);
+                win.refresh();
+            });
+        }
+        {
+            let win = self.clone();
+            self.canvas.widget.connect_resize(move |_, _, _| win.sync_backdrops_soon());
+        }
         self.install_actions();
         self.install_shortcuts();
     }
 
+    /// Tell the canvas how much of it the floating panels cover.
+    ///
+    /// The canvas widget genuinely does extend underneath them — that is what
+    /// makes them read as floating — so this is the only thing keeping the
+    /// document from being centred half-behind the Layers panel.
+    fn sync_insets(self: &Rc<Self>) {
+        let m = metrics::PANEL_MARGIN as f32;
+        let insets = crate::state::Insets {
+            left: if self.layers_panel.is_visible() {
+                metrics::LAYERS_WIDTH as f32 + m * 2.0
+            } else {
+                m
+            },
+            right: (metrics::OPTIONS_WIDTH + metrics::RAIL_WIDTH) as f32 + m * 3.0,
+            top: m,
+            bottom: m + STATUS_HEIGHT as f32,
+        };
+        self.canvas.set_insets(insets);
+    }
+
+    /// Hand the canvas the panel rectangles so it can frost the image behind
+    /// them.
+    ///
+    /// Measured from the live widget allocations rather than recomputed from
+    /// the metrics constants: the rail's height depends on how many tools it
+    /// holds, and a frosted rectangle that disagrees with the panel drawn on
+    /// top of it by even a pixel is immediately visible as a bright fringe.
+    fn sync_backdrops(self: &Rc<Self>) {
+        let canvas = &self.canvas.widget;
+        let mut rects = Vec::new();
+        for panel in self.backdrop_widgets() {
+            if !panel.is_visible() {
+                continue;
+            }
+            let Some(b) = panel.compute_bounds(canvas) else { continue };
+            if b.width() < 1.0 || b.height() < 1.0 {
+                continue;
+            }
+            // A panel wider than it asked for means some child's minimum width
+            // won the negotiation, which pushes the panel out over the canvas.
+            // The frosting follows it either way, so this is not a visual
+            // glitch — it is a layout bug that would otherwise go unnoticed.
+            if panel == self.options_panel {
+                let want = metrics::OPTIONS_WIDTH as f32;
+                if b.width() > want + 1.0 {
+                    log::warn!(
+                        "tool options panel is {:.0}px wide, {:.0}px over its budget — \
+                         a control in it has a minimum width that does not fit",
+                        b.width(),
+                        b.width() - want,
+                    );
+                }
+            }
+            rects.push(pixelmagic_gpu::renderer::BackdropRect {
+                x: b.x(),
+                y: b.y(),
+                width: b.width(),
+                height: b.height(),
+            });
+        }
+        self.canvas.set_backdrops(rects);
+    }
+
+    fn backdrop_widgets(&self) -> [gtk::Widget; 3] {
+        [
+            self.layers_panel.clone().upcast(),
+            self.options_panel.clone().upcast(),
+            self.rail.widget.clone().upcast(),
+        ]
+    }
+
+    /// Re-measure the panels once GTK has finished laying them out.
+    ///
+    /// Allocations are not valid at the moment something asks for a change, so
+    /// measuring immediately after a resize or a toggle reads the *previous*
+    /// frame's geometry. One idle callback is enough to land after layout.
+    fn sync_backdrops_soon(self: &Rc<Self>) {
+        let win = self.clone();
+        glib::idle_add_local_once(move || win.sync_backdrops());
+    }
+
     /// Rebuild everything that mirrors document state.
     pub fn refresh(self: &Rc<Self>) {
+        self.sync_insets();
+        // The options panel is rebuilt below and its height — and, if a panel
+        // misbehaves, its width — changes with it. Without this the frosted
+        // rectangle keeps the previous panel's shape and leaves a blurred
+        // ghost sitting on the canvas.
+        self.sync_backdrops_soon();
         self.layers.refresh();
-        self.rebuild_inspector();
+        self.rebuild_options();
         self.canvas.widget.queue_render();
 
         let st = self.state.borrow();
-        self.title.set_title(&st.title());
-        self.title.set_subtitle(&format!(
-            "{} × {} · {:.0}%",
-            st.document.width,
-            st.document.height,
-            st.view.zoom * 100.0
-        ));
+        self.title.set_text(&st.document.name);
+        self.subtitle.set_text(if st.document.dirty { "Edited" } else { "" });
 
         let selection = if st.document.has_selection() {
-            let b = st.selection_bounds_label();
-            format!(" · selection {b}")
+            format!("  ·  selection {}", st.selection_bounds_label())
         } else {
             String::new()
         };
-        let undo =
-            st.history.undo_label().map(|l| format!(" · next undo: {l}")).unwrap_or_default();
         self.status.set_text(&format!(
-            "{} · {} layers{selection}{undo}",
-            st.tool.label(),
-            st.document.layers.len()
+            "{} × {} px  ·  {} layers  ·  {:.0}%{selection}",
+            st.document.width,
+            st.document.height,
+            st.document.layers.len(),
+            st.view.zoom * 100.0,
         ));
+
+        let zoom = st.view.zoom;
+        let tool = st.tool;
         drop(st);
 
-        // Read the tool into a local *before* calling into the sidebar. Written
-        // as `set_active_silently(self.state.borrow().tool)` the temporary
-        // borrow would live until the end of the statement — i.e. across
-        // `set_active`, which synchronously fires `toggled`, whose handler
-        // takes `borrow_mut`. That is an instant panic, and it is invisible
-        // until something actually toggles a button.
-        let tool = self.state.borrow().tool;
-        self.tools.set_active_silently(tool);
+        self.syncing.set(true);
+        self.zoom.set_value(zoom.max(0.01).log2() as f64);
+        self.syncing.set(false);
+
+        self.options_title.set_text(tool.label());
+        self.rail.set_active_silently(tool);
     }
 
-    fn rebuild_inspector(self: &Rc<Self>) {
-        while let Some(child) = self.inspector.first_child() {
-            self.inspector.remove(&child);
+    fn rebuild_options(self: &Rc<Self>) {
+        while let Some(child) = self.options_body.first_child() {
+            self.options_body.remove(&child);
         }
 
         let on_change: Rc<dyn Fn()> = {
@@ -253,15 +372,14 @@ impl Window {
         let tool = self.state.borrow().tool;
         let panel = match tool {
             Tool::ColorAdjustments => {
-                // Computing this means rendering the document, so it happens
-                // only when the pane is actually being shown.
                 let histogram = self.canvas.histogram();
                 build_adjustments_panel(self.state.clone(), on_change.clone(), histogram)
             }
             Tool::Effects => build_effects_panel(self.state.clone(), on_change.clone()),
+            Tool::Arrange => build_arrange_panel(self.state.clone(), on_change.clone()),
             _ => build_tool_options(self.state.clone(), on_change.clone()),
         };
-        self.inspector.append(&panel);
+        self.options_body.append(&panel);
     }
 
     // -- actions ------------------------------------------------------------
@@ -392,57 +510,50 @@ impl Window {
             let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
 
-            // Bare letters select tools, exactly as documented in SPEC §5.1 —
-            // but only when no modifier is held, or Ctrl+S would pick the Style
-            // tool instead of saving.
-            if !ctrl {
-                if let Some(ch) = key.to_unicode() {
-                    if ch.is_ascii_alphabetic() && !shift {
-                        if let Some(tool) = Tool::from_shortcut(ch) {
-                            if tool.is_implemented() {
-                                win.state.borrow_mut().tool = tool;
-                                win.refresh();
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                    }
-                    if shift {
-                        // Shift + a tool's letter cycles its group.
-                        if let Some(tool) = Tool::from_shortcut(ch.to_ascii_lowercase()) {
-                            let next = tool.cycle();
-                            if next != tool && next.is_implemented() {
-                                win.state.borrow_mut().tool = next;
-                                win.refresh();
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                    }
-                    match ch {
-                        'x' | 'X' => {
-                            win.state.borrow_mut().colors.swap();
-                            win.refresh();
-                            return glib::Propagation::Stop;
-                        }
-                        'd' | 'D' => {
-                            win.state.borrow_mut().colors.reset();
-                            win.refresh();
-                            return glib::Propagation::Stop;
-                        }
-                        '[' => {
-                            win.state.borrow_mut().brush.step_size(false);
-                            win.refresh();
-                            return glib::Propagation::Stop;
-                        }
-                        ']' => {
-                            win.state.borrow_mut().brush.step_size(true);
-                            win.refresh();
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
+            // Ctrl-anything belongs to the accelerators.
+            if ctrl {
+                return glib::Propagation::Proceed;
+            }
+            let Some(ch) = key.to_unicode() else {
+                return glib::Propagation::Proceed;
+            };
+
+            if ch.is_ascii_alphabetic() {
+                let target = if shift {
+                    Tool::from_shortcut(ch.to_ascii_lowercase()).map(|t| t.cycle())
+                } else {
+                    Tool::from_shortcut(ch)
+                };
+                if let Some(tool) = target.filter(|t| t.is_implemented()) {
+                    win.state.borrow_mut().tool = tool;
+                    win.refresh();
+                    return glib::Propagation::Stop;
                 }
             }
-            glib::Propagation::Proceed
+
+            match ch {
+                'x' | 'X' => {
+                    win.state.borrow_mut().colors.swap();
+                    win.refresh();
+                    glib::Propagation::Stop
+                }
+                'd' | 'D' => {
+                    win.state.borrow_mut().colors.reset();
+                    win.refresh();
+                    glib::Propagation::Stop
+                }
+                '[' => {
+                    win.state.borrow_mut().brush.step_size(false);
+                    win.refresh();
+                    glib::Propagation::Stop
+                }
+                ']' => {
+                    win.state.borrow_mut().brush.step_size(true);
+                    win.refresh();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
         });
         self.window.add_controller(controller);
     }
@@ -450,9 +561,7 @@ impl Window {
     // -- file handling ------------------------------------------------------
 
     fn action_new(self: &Rc<Self>) {
-        let mut st = self.state.borrow_mut();
-        *st = EditorState::new(Document::new(1920, 1080));
-        drop(st);
+        *self.state.borrow_mut() = EditorState::new(Document::new(1920, 1080));
         self.canvas.zoom_to_fit();
         self.refresh();
     }
@@ -467,7 +576,6 @@ impl Window {
         filters.append(&filter);
 
         let dialog = gtk::FileDialog::builder().title("Open").filters(&filters).build();
-
         let win = self.clone();
         dialog.open(Some(&self.window), gio::Cancellable::NONE, move |result| {
             let Ok(file) = result else { return };
@@ -568,11 +676,6 @@ impl Window {
         });
     }
 
-    /// Export the flattened document.
-    ///
-    /// Renders through the same pipeline the canvas uses rather than a separate
-    /// CPU path, so what is exported is exactly what was on screen. That is
-    /// worth the awkwardness of needing the GL context current.
     fn export_to(self: &Rc<Self>, path: PathBuf) {
         self.canvas.widget.make_current();
         match self.canvas.render_to_buffer() {
@@ -615,4 +718,99 @@ impl Window {
         dialog.add_response("ok", "OK");
         dialog.present();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap content in a floating panel: rounded, translucent, shadowed.
+fn panel_shell(content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panel.add_css_class("pm-panel");
+    panel.append(content);
+    panel
+}
+
+fn set_margins(w: &impl IsA<gtk::Widget>, m: i32) {
+    let w = w.as_ref();
+    w.set_margin_top(m);
+    w.set_margin_bottom(m);
+    w.set_margin_start(m);
+    w.set_margin_end(m);
+}
+
+/// The toolbar zoom control: minus, slider, plus.
+///
+/// The scale is in log2 units, so a fixed drag distance always changes the zoom
+/// by a fixed *ratio*. On a linear scale everything below 100% is crammed into
+/// the leftmost sliver, which is where most photo editing actually happens.
+fn build_zoom_control() -> (gtk::Box, gtk::Scale) {
+    let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    container.set_valign(gtk::Align::Center);
+
+    let out = gtk::Button::from_icon_name("zoom-out-symbolic");
+    out.add_css_class("flat");
+    out.set_action_name(Some("win.zoom-out"));
+    out.set_tooltip_text(Some("Zoom out"));
+
+    let scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        (crate::state::View::MIN_ZOOM as f64).log2(),
+        (crate::state::View::MAX_ZOOM as f64).log2(),
+        0.05,
+    );
+    scale.add_css_class("pm-zoom");
+    scale.set_draw_value(false);
+    scale.set_size_request(110, -1);
+    scale.set_value(0.0);
+
+    let inn = gtk::Button::from_icon_name("zoom-in-symbolic");
+    inn.add_css_class("flat");
+    inn.set_action_name(Some("win.zoom-in"));
+    inn.set_tooltip_text(Some("Zoom in"));
+
+    container.append(&out);
+    container.append(&scale);
+    container.append(&inn);
+    (container, scale)
+}
+
+fn build_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+
+    let file = gio::Menu::new();
+    file.append(Some("New"), Some("win.new"));
+    file.append(Some("Open…"), Some("win.open"));
+    file.append(Some("Save"), Some("win.save"));
+    file.append(Some("Export…"), Some("win.export"));
+    menu.append_section(Some("File"), &file);
+
+    let edit = gio::Menu::new();
+    edit.append(Some("Undo"), Some("win.undo"));
+    edit.append(Some("Redo"), Some("win.redo"));
+    menu.append_section(Some("Edit"), &edit);
+
+    let layer = gio::Menu::new();
+    layer.append(Some("New Layer"), Some("win.layer-new"));
+    layer.append(Some("Duplicate Layer"), Some("win.layer-duplicate"));
+    layer.append(Some("Delete Layer"), Some("win.layer-delete"));
+    layer.append(Some("Group Layers"), Some("win.layer-group"));
+    layer.append(Some("Color Adjustments Layer"), Some("win.layer-adjustments"));
+    layer.append(Some("Effects Layer"), Some("win.layer-effects"));
+    menu.append_section(Some("Layer"), &layer);
+
+    let view = gio::Menu::new();
+    view.append(Some("Zoom to Fit"), Some("win.zoom-fit"));
+    view.append(Some("Actual Size"), Some("win.zoom-actual"));
+    menu.append_section(Some("View"), &view);
+
+    let select = gio::Menu::new();
+    select.append(Some("Select All"), Some("win.select-all"));
+    select.append(Some("Deselect"), Some("win.deselect"));
+    select.append(Some("Invert Selection"), Some("win.select-invert"));
+    menu.append_section(Some("Select"), &select);
+
+    menu.append(Some("About Pixelmagic"), Some("win.about"));
+    menu
 }

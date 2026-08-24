@@ -20,43 +20,87 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// Widget-space margins that the floating panels occupy.
+///
+/// The canvas runs full-bleed *underneath* the panels — that is what makes them
+/// look like they float — but the document must not be centred underneath one,
+/// or half the image is behind the Layers panel and unreachable. So the visible
+/// area is the widget minus these insets, and everything that positions the
+/// document works in that rectangle instead of the whole widget.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Insets {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl Insets {
+    /// The free rectangle inside a widget of this size, never collapsing to a
+    /// negative extent on a window narrower than the panels themselves.
+    fn free(self, widget_w: f32, widget_h: f32) -> (f32, f32, f32, f32) {
+        let w = (widget_w - self.left - self.right).max(1.0);
+        let h = (widget_h - self.top - self.bottom).max(1.0);
+        (self.left, self.top, w, h)
+    }
+}
+
 /// How the canvas maps document space to widget space.
 #[derive(Debug, Clone, Copy)]
 pub struct View {
     pub zoom: f32,
     /// Pan offset in widget pixels.
     pub offset: glam::Vec2,
+    /// Space taken by the floating panels, so the document centres in what the
+    /// user can actually see.
+    pub insets: Insets,
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { zoom: 1.0, offset: glam::Vec2::ZERO }
+        Self { zoom: 1.0, offset: glam::Vec2::ZERO, insets: Insets::default() }
     }
 }
 
 impl View {
     pub const MIN_ZOOM: f32 = 0.02;
+
+    /// [`View::fit_with`] against the whole widget. Tests only — the
+    /// application always has panels.
+    #[cfg(test)]
+    fn fit_no_insets(doc_w: f32, doc_h: f32, widget_w: f32, widget_h: f32) -> Self {
+        Self::fit_with(doc_w, doc_h, widget_w, widget_h, Insets::default())
+    }
     pub const MAX_ZOOM: f32 = 64.0;
 
-    /// Zoom so the whole document fits, with a small margin.
-    pub fn fit(doc_w: f32, doc_h: f32, widget_w: f32, widget_h: f32) -> Self {
+    /// Zoom so the whole document fits inside the area the panels leave free,
+    /// with a small margin.
+    pub fn fit_with(
+        doc_w: f32,
+        doc_h: f32,
+        widget_w: f32,
+        widget_h: f32,
+        insets: Insets,
+    ) -> Self {
         if doc_w <= 0.0 || doc_h <= 0.0 || widget_w <= 0.0 || widget_h <= 0.0 {
-            return View::default();
+            return View { insets, ..View::default() };
         }
+        let (_, _, free_w, free_h) = insets.free(widget_w, widget_h);
         let margin = 32.0;
-        let zoom = ((widget_w - margin) / doc_w)
-            .min((widget_h - margin) / doc_h)
+        let zoom = ((free_w - margin) / doc_w)
+            .min((free_h - margin) / doc_h)
             .clamp(Self::MIN_ZOOM, 1.0);
-        View { zoom, offset: glam::Vec2::ZERO }
+        View { zoom, offset: glam::Vec2::ZERO, insets }
     }
 
     /// Widget-space rectangle the document occupies.
     pub fn document_rect(self, doc_w: f32, doc_h: f32, widget_w: f32, widget_h: f32) -> Rect {
         let w = doc_w * self.zoom;
         let h = doc_h * self.zoom;
+        let (fx, fy, fw, fh) = self.insets.free(widget_w, widget_h);
         Rect::new(
-            (widget_w - w) * 0.5 + self.offset.x,
-            (widget_h - h) * 0.5 + self.offset.y,
+            fx + (fw - w) * 0.5 + self.offset.x,
+            fy + (fh - h) * 0.5 + self.offset.y,
             w,
             h,
         )
@@ -213,11 +257,6 @@ impl EditorState {
         self.needs_redraw = true;
     }
 
-    pub fn title(&self) -> String {
-        let star = if self.document.dirty { " •" } else { "" };
-        format!("{}{star}", self.document.name)
-    }
-
     pub fn file_name(&self) -> String {
         self.document
             .path
@@ -268,27 +307,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn insets_centre_the_document_in_the_free_area_not_the_widget() {
+        // Panels covering 300px on the left and 100px on the right leave the
+        // free area centred at x = 300 + (1000-300-100)/2 = 600, not 500.
+        let insets = Insets { left: 300.0, right: 100.0, top: 0.0, bottom: 0.0 };
+        let view = View { zoom: 1.0, offset: glam::Vec2::ZERO, insets };
+        let r = view.document_rect(200.0, 100.0, 1000.0, 400.0);
+        assert_eq!(r.x + r.width * 0.5, 600.0);
+        assert_eq!(r.y + r.height * 0.5, 200.0);
+
+        // And with no insets it is the plain centre, so nothing else changes.
+        let plain = View::default().document_rect(200.0, 100.0, 1000.0, 400.0);
+        assert_eq!(plain.x + plain.width * 0.5, 500.0);
+    }
+
+    #[test]
+    fn fit_with_insets_fits_the_free_area() {
+        // A 900-wide document in a 1000-wide widget fits at 1:1 with no
+        // panels, but must shrink once 400px of it is covered.
+        let none = View::fit_no_insets(900.0, 100.0, 1000.0, 1000.0);
+        let some = View::fit_with(
+            900.0,
+            100.0,
+            1000.0,
+            1000.0,
+            Insets { left: 300.0, right: 100.0, top: 0.0, bottom: 0.0 },
+        );
+        assert!(some.zoom < none.zoom, "{} should be under {}", some.zoom, none.zoom);
+        // The scaled document plus the fit margin stays within the free width.
+        assert!(900.0 * some.zoom <= 600.0);
+    }
+
+    #[test]
+    fn insets_wider_than_the_window_do_not_invert_the_free_area() {
+        let insets = Insets { left: 600.0, right: 600.0, top: 0.0, bottom: 0.0 };
+        let view = View::fit_with(100.0, 100.0, 800.0, 800.0, insets);
+        assert!(view.zoom > 0.0 && view.zoom.is_finite());
+        let r = view.document_rect(100.0, 100.0, 800.0, 800.0);
+        assert!(r.width > 0.0 && r.x.is_finite());
+    }
+
+    #[test]
     fn fit_keeps_the_document_inside_the_widget() {
-        let v = View::fit(1000.0, 500.0, 400.0, 400.0);
+        let v = View::fit_no_insets(1000.0, 500.0, 400.0, 400.0);
         assert!(v.zoom * 1000.0 <= 400.0);
         assert!(v.zoom > 0.0);
     }
 
     #[test]
     fn fit_never_upscales() {
-        let v = View::fit(10.0, 10.0, 2000.0, 2000.0);
+        let v = View::fit_no_insets(10.0, 10.0, 2000.0, 2000.0);
         assert_eq!(v.zoom, 1.0, "a tiny document should not be blown up to fill");
     }
 
     #[test]
     fn fit_handles_degenerate_input() {
-        assert_eq!(View::fit(0.0, 0.0, 100.0, 100.0).zoom, 1.0);
-        assert_eq!(View::fit(100.0, 100.0, 0.0, 0.0).zoom, 1.0);
+        assert_eq!(View::fit_no_insets(0.0, 0.0, 100.0, 100.0).zoom, 1.0);
+        assert_eq!(View::fit_no_insets(100.0, 100.0, 0.0, 0.0).zoom, 1.0);
     }
 
     #[test]
     fn document_coordinates_round_trip() {
-        let v = View { zoom: 2.0, offset: glam::Vec2::new(10.0, -5.0) };
+        let v =
+            View { zoom: 2.0, offset: glam::Vec2::new(10.0, -5.0), insets: Insets::default() };
         let r = v.document_rect(100.0, 50.0, 400.0, 300.0);
         let widget = glam::Vec2::new(r.x + 2.0 * 3.0, r.y + 2.0 * 7.0);
         let doc = v.to_document(widget, 100.0, 50.0, 400.0, 300.0);
@@ -365,14 +446,6 @@ mod tests {
 
         state.set_selection(Selection::none(8, 8));
         assert!(state.document.selection.is_none());
-    }
-
-    #[test]
-    fn title_marks_unsaved_changes() {
-        let mut state = EditorState::new(Document::new(8, 8));
-        assert!(!state.title().contains('•'));
-        state.document.dirty = true;
-        assert!(state.title().contains('•'));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod brush;
 mod canvas;
 mod state;
+mod style;
 mod ui;
 mod window;
 
@@ -14,31 +15,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 const APP_ID: &str = "dev.pixelmagic.Pixelmagic";
-
-/// Minimal styling. Everything else comes from libadwaita, so Pixelmagic
-/// follows the user's system theme instead of imposing its own — which is the
-/// point of being GTK-native rather than a port.
-const CSS: &str = "
-.tool-button {
-    min-width: 40px;
-    min-height: 34px;
-    padding: 0;
-    font-size: 15px;
-}
-.tools-sidebar {
-    background: @sidebar_bg_color;
-}
-.layers-sidebar {
-    background: @sidebar_bg_color;
-}
-.param-row {
-    margin: 2px 0;
-}
-.histogram {
-    border-radius: 6px;
-    margin: 4px 0;
-}
-";
 
 fn main() -> glib::ExitCode {
     env_logger::Builder::from_env(
@@ -82,8 +58,14 @@ fn main() -> glib::ExitCode {
     ];
 
     app.connect_startup(|_| {
+        // Pixelmator Pro's interface is dark, full stop — it has no light mode,
+        // because a light chrome changes how you judge the colours inside the
+        // canvas. Following the system preference here would be the wrong kind
+        // of good citizenship.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+
         let provider = gtk::CssProvider::new();
-        provider.load_from_string(CSS);
+        provider.load_from_string(crate::style::CSS);
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,

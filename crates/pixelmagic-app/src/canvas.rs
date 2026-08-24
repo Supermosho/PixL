@@ -9,6 +9,7 @@ use pixelmagic_core::history::PixelRegionEdit;
 use pixelmagic_core::layer::LayerKind;
 use pixelmagic_core::selection::Selection;
 use pixelmagic_core::tool::{Tool, ToolCategory};
+use pixelmagic_gpu::renderer::{BackdropRect, BackdropStyle};
 use pixelmagic_gpu::Renderer;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,6 +35,10 @@ pub struct Canvas {
     /// between drag-begin and drag-end; putting a transient like this in the
     /// shared state invites it being left set after a cancelled gesture.
     pending_edit: RefCell<Option<PixelRegionEdit>>,
+    /// Where the floating panels sit, in widget-logical pixels, so the
+    /// renderer can frost the canvas underneath them. Empty means no frosting.
+    backdrops: Rc<RefCell<Vec<BackdropRect>>>,
+    backdrop_style: Rc<std::cell::Cell<BackdropStyle>>,
 }
 
 impl Canvas {
@@ -52,6 +57,11 @@ impl Canvas {
             state,
             on_change: RefCell::new(Vec::new()),
             pending_edit: RefCell::new(None),
+            backdrops: Rc::new(RefCell::new(Vec::new())),
+            backdrop_style: Rc::new(std::cell::Cell::new(BackdropStyle {
+                corner: crate::style::metrics::PANEL_CORNER,
+                ..BackdropStyle::default()
+            })),
         });
 
         canvas.connect_gl();
@@ -111,6 +121,8 @@ impl Canvas {
 
         let gl_cell = self.gl.clone();
         let state = self.state.clone();
+        let backdrops = self.backdrops.clone();
+        let backdrop_style = self.backdrop_style.clone();
         self.widget.connect_render(move |area, _ctx| {
             let mut gl_ref = gl_cell.borrow_mut();
             let Some(gl) = gl_ref.as_mut() else { return glib::Propagation::Proceed };
@@ -150,6 +162,33 @@ impl Canvas {
                     gl.renderer.release(image);
                 }
                 Err(e) => log::error!("render failed: {e}"),
+            }
+
+            // Frost the canvas under the floating panels. This has to come
+            // after `present` — it blurs what is already in the framebuffer —
+            // and before GTK draws the panel widgets over the top.
+            let rects: Vec<_> = backdrops
+                .borrow()
+                .iter()
+                .map(|r| BackdropRect {
+                    x: r.x * scale as f32,
+                    y: r.y * scale as f32,
+                    width: r.width * scale as f32,
+                    height: r.height * scale as f32,
+                })
+                .collect();
+            if !rects.is_empty() {
+                let mut style = backdrop_style.get();
+                style.radius *= scale as f32;
+                style.corner *= scale as f32;
+                if let Err(e) =
+                    gl.renderer.blur_backdrop((width, height), &rects, style, target)
+                {
+                    // Not fatal: the panels are still legible against their own
+                    // tint, so log once and carry on rather than killing the
+                    // frame.
+                    log::warn!("backdrop blur failed: {e}");
+                }
             }
             glib::Propagation::Stop
         });
@@ -520,19 +559,70 @@ impl Canvas {
         hist
     }
 
+    /// Tell the canvas where the floating panels are, so it can frost the
+    /// image behind them.
+    ///
+    /// Rectangles are in widget-logical pixels with a top-left origin — the
+    /// same space GTK allocates widgets in — so a caller can hand over an
+    /// allocation directly.
+    pub fn set_backdrops(&self, rects: Vec<BackdropRect>) {
+        let changed = *self.backdrops.borrow() != rects;
+        *self.backdrops.borrow_mut() = rects;
+        if changed {
+            self.widget.queue_render();
+        }
+    }
+
+    /// Tell the canvas how much of it the floating panels cover, so the
+    /// document centres in what is actually visible.
+    pub fn set_insets(&self, insets: crate::state::Insets) {
+        let changed = {
+            let mut st = self.state.borrow_mut();
+            let changed = st.view.insets != insets;
+            st.view.insets = insets;
+            changed
+        };
+        if changed {
+            self.queue_redraw();
+        }
+    }
+
     /// Fit the document to the widget — `Command-0`.
     pub fn zoom_to_fit(&self) {
         let (w, h) = self.widget_size();
         let mut st = self.state.borrow_mut();
         let (dw, dh) = (st.document.width as f32, st.document.height as f32);
-        st.view = View::fit(dw, dh, w, h);
+        let insets = st.view.insets;
+        st.view = View::fit_with(dw, dh, w, h, insets);
         drop(st);
         self.queue_redraw();
     }
 
     pub fn zoom_actual(&self) {
         let mut st = self.state.borrow_mut();
-        st.view = View::default();
+        let insets = st.view.insets;
+        st.view = View { insets, ..View::default() };
+        drop(st);
+        self.queue_redraw();
+    }
+
+    /// Centre of the area the panels leave free — the natural anchor for a
+    /// zoom that did not come from the pointer.
+    fn free_centre(&self, w: f32, h: f32, insets: crate::state::Insets) -> glam::Vec2 {
+        glam::Vec2::new(
+            (insets.left + (w - insets.right)) * 0.5,
+            (insets.top + (h - insets.bottom)) * 0.5,
+        )
+    }
+
+    /// Set an absolute zoom, keeping the centre of the view fixed.
+    pub fn set_zoom(&self, zoom: f32) {
+        let (w, h) = self.widget_size();
+        let mut st = self.state.borrow_mut();
+        let (dw, dh) = (st.document.width as f32, st.document.height as f32);
+        let anchor = self.free_centre(w, h, st.view.insets);
+        let factor = zoom / st.view.zoom.max(1e-6);
+        st.view.zoom_about(factor, anchor, dw, dh, w, h);
         drop(st);
         self.queue_redraw();
     }
@@ -541,7 +631,8 @@ impl Canvas {
         let (w, h) = self.widget_size();
         let mut st = self.state.borrow_mut();
         let (dw, dh) = (st.document.width as f32, st.document.height as f32);
-        st.view.zoom_about(factor, glam::Vec2::new(w * 0.5, h * 0.5), dw, dh, w, h);
+        let anchor = self.free_centre(w, h, st.view.insets);
+        st.view.zoom_about(factor, anchor, dw, dh, w, h);
         drop(st);
         self.queue_redraw();
     }

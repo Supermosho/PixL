@@ -269,6 +269,51 @@ impl Transform {
     }
 }
 
+/// A transform broken into the parts a user actually edits.
+///
+/// The Arrange panel needs to show "this layer is at 40,80, 200x150, rotated
+/// 12°" and write those back. A 3x3 matrix cannot answer that directly, so it
+/// is decomposed. The decomposition is exact for any transform built from
+/// translate/rotate/scale/flip — which is every transform the UI produces — and
+/// approximate for a sheared one, where it reports the closest rotation and
+/// drops the shear.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decomposed {
+    pub translation: Vec2,
+    /// Radians, counter-clockwise.
+    pub rotation: f32,
+    /// Negative on an axis means the layer is mirrored along it.
+    pub scale: Vec2,
+}
+
+impl Transform {
+    pub fn decompose(&self) -> Decomposed {
+        let m = self.0;
+        let x = Vec2::new(m.x_axis.x, m.x_axis.y);
+        let y = Vec2::new(m.y_axis.x, m.y_axis.y);
+
+        let mut scale = Vec2::new(x.length(), y.length());
+        // A negative determinant means one axis is mirrored. Which one is
+        // arbitrary — the same matrix is "flipped horizontally" or "flipped
+        // vertically and rotated 180°" — so pick y by convention and stay
+        // consistent, or a flip followed by a read-back would drift.
+        if m.determinant() < 0.0 {
+            scale.y = -scale.y;
+        }
+        Decomposed {
+            translation: Vec2::new(m.z_axis.x, m.z_axis.y),
+            rotation: x.y.atan2(x.x),
+            scale,
+        }
+    }
+
+    pub fn compose(d: Decomposed) -> Transform {
+        Transform::scale(d.scale)
+            .then(&Transform::rotate(d.rotation))
+            .then(&Transform::translate(d.translation))
+    }
+}
+
 /// How a resize should treat the source aspect ratio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ResizeMode {
@@ -346,6 +391,47 @@ mod tests {
         assert!(Transform::translate(Vec2::new(3.0, -7.0)).is_integer_translation());
         assert!(!Transform::translate(Vec2::new(3.5, 0.0)).is_integer_translation());
         assert!(!Transform::rotate(0.1).is_integer_translation());
+    }
+
+    #[test]
+    fn decompose_round_trips() {
+        for (t, r, s) in [
+            (Vec2::new(10.0, -4.0), 0.0, Vec2::new(1.0, 1.0)),
+            (Vec2::new(0.0, 0.0), 0.7, Vec2::new(2.0, 3.0)),
+            (Vec2::new(-5.5, 12.25), -1.2, Vec2::new(0.5, 0.25)),
+        ] {
+            let original =
+                Transform::compose(Decomposed { translation: t, rotation: r, scale: s });
+            let d = original.decompose();
+            assert!((d.translation - t).length() < 1e-4, "translation: {d:?}");
+            assert!((d.rotation - r).abs() < 1e-4, "rotation: {d:?}");
+            assert!((d.scale - s).length() < 1e-4, "scale: {d:?}");
+
+            let rebuilt = Transform::compose(d);
+            let p = Vec2::new(3.0, 7.0);
+            assert!((rebuilt.apply(p) - original.apply(p)).length() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn decompose_identity() {
+        let d = Transform::IDENTITY.decompose();
+        assert_eq!(d.translation, Vec2::ZERO);
+        assert!(d.rotation.abs() < 1e-6);
+        assert!((d.scale - Vec2::ONE).length() < 1e-6);
+    }
+
+    #[test]
+    fn decompose_detects_a_mirror() {
+        let flipped = Transform::compose(Decomposed {
+            translation: Vec2::ZERO,
+            rotation: 0.0,
+            scale: Vec2::new(1.0, -1.0),
+        });
+        let d = flipped.decompose();
+        assert!(d.scale.y < 0.0, "a mirrored layer should report negative scale: {d:?}");
+        // And it survives a round trip rather than flipping back.
+        assert!(Transform::compose(d).decompose().scale.y < 0.0);
     }
 
     #[test]
