@@ -169,7 +169,7 @@ than of the application.
 
 ---
 
-## Honest status
+## Status
 
 The tool roster and effect catalogue are complete *as data* — all 50 tools and
 ~75 effects are catalogued from Apple's published documentation, with their real
