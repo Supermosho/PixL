@@ -1,8 +1,8 @@
-# Pixelmagic
+# PixL
 
 A GTK4-native, GPU-accelerated, non-destructive image editor for Linux.
 
-Pixelmagic is a clean-room reimplementation of the *interaction model* of
+PixL is a clean-room reimplementation of the *interaction model* of
 Pixelmator Pro — layer-based, non-destructive, with adjustments and effects that
 stay editable forever — built on GTK4, libadwaita and OpenGL. It is not a port,
 a wrapper, or a compatibility layer. It shares no code, no assets and no file
@@ -43,14 +43,14 @@ sudo dnf install gtk4-devel libadwaita-devel libepoxy-devel mesa-libGL-devel
 sudo pacman -S gtk4 libadwaita libepoxy
 
 cargo build --release
-./target/release/pixelmagic
+./target/release/PixL
 ```
 
 ### Verifying a build
 
 ```sh
 cargo test                          # model, engine and I/O
-./target/release/pixelmagic --check-shaders   # compiles all 43 shaders headlessly
+./target/release/PixL --check-shaders   # compiles all 43 shaders headlessly
 ./scripts/smoke-test.sh             # launches the app under Xvfb and drives it
 ```
 
@@ -73,10 +73,10 @@ others.
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
-| `pixelmagic-core` | Document model: layers, adjustments, effects, masks, selections, history. Pure data and pure functions — no GTK, no GL, no I/O. | — |
-| `pixelmagic-gpu` | OpenGL shader library (fragment + compute) and the render graph. Owns no GTK types. | core |
-| `pixelmagic-io` | Image decode/encode and the `.pxm` container. | core |
-| `pixelmagic-app` | GTK4 front end: canvas widget, sidebars, tools, actions. | all |
+| `PixL-core` | Document model: layers, adjustments, effects, masks, selections, history. Pure data and pure functions — no GTK, no GL, no I/O. | — |
+| `PixL-gpu` | OpenGL shader library (fragment + compute) and the render graph. Owns no GTK types. | core |
+| `PixL-io` | Image decode/encode and the `.pxm` container. | core |
+| `PixL-app` | GTK4 front end: canvas widget, sidebars, tools, actions. | all |
 
 The core crate having no dependency on a display server is what makes the model
 testable: 169 of the project's 260 tests run without GTK, GL, or a window. The
@@ -132,9 +132,9 @@ assuming. Measured on llvmpipe at 1024², gaussian:
 
 A dispatch has fixed overhead while the shared-memory saving scales with radius,
 so below a crossover the fragment path wins. `Renderer` uses compute only at or
-above `PIXELMAGIC_COMPUTE_BLUR_MIN` (default 12). A software rasteriser is the
+above `PixL_COMPUTE_BLUR_MIN` (default 12). A software rasteriser is the
 pessimistic case — it has no on-die scratchpad — so real hardware should cross
-over lower; `cargo run --release -p pixelmagic-gpu --example bench` measures it
+over lower; `cargo run --release -p PixL-gpu --example bench` measures it
 on yours.
 
 The histogram is the other half of the story, and the more interesting one: a
@@ -209,7 +209,7 @@ claim marked as such.
 A Zip archive, deliberately inspectable:
 
 ```
-mimetype          stored uncompressed — "application/x-pixelmagic"
+mimetype          stored uncompressed — "application/x-PixL"
 document.json     the whole model minus pixel data
 layers/<n>.png    one PNG per pixel layer, depth-first order
 masks/<n>.png     one greyscale PNG per bitmap mask
@@ -222,7 +222,7 @@ point.
 
 ## A note on Pixelmator Pro
 
-Pixelmagic reimplements *behaviour* — what a tool does, what a slider is called,
+PixL reimplements *behaviour* — what a tool does, what a slider is called,
 how a non-destructive stack composes. It contains none of Apple's code, icons,
 artwork or trade dress, and it does not read or write `.pxd`. Every name and
 description in `docs/SPEC.md` is cited to Apple's public user guide, and every
