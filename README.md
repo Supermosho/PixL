@@ -75,7 +75,7 @@ others.
 |---|---|---|
 | `PixL-core` | Document model: layers, adjustments, effects, masks, selections, history. Pure data and pure functions — no GTK, no GL, no I/O. | — |
 | `PixL-gpu` | OpenGL shader library (fragment + compute) and the render graph. Owns no GTK types. | core |
-| `PixL-io` | Image decode/encode and the `.pxm` container. | core |
+| `PixL-io` | Image decode/encode and the `.pxl` container. | core |
 | `PixL-app` | GTK4 front end: canvas widget, sidebars, tools, actions. | all |
 
 The core crate having no dependency on a display server is what makes the model
@@ -188,7 +188,7 @@ About window reports both counts.
 | Painting, erasing, dodge/burn, saturate, soften, sharpen | Working |
 | Rectangular / oval / row / column selections, feather, boolean ops | Working (no marching-ants overlay yet — selections clip tools but are invisible) |
 | Undo/redo with gesture coalescing and region snapshots | Working |
-| Open PNG/JPEG/TIFF/WebP/BMP/GIF, save `.pxm`, export | Working |
+| Open PNG/JPEG/TIFF/WebP/BMP/GIF, save `.pxl`, export | Working |
 | Adjustments with generated panels (10 of 16) | Working |
 | Levels, Curves, colour wheels, Channel Mixer | Model, shaders and histogram exist; need bespoke editors |
 | Effects with shaders (41 of ~75) | Working |
@@ -204,7 +204,7 @@ claim marked as such.
 
 ---
 
-## The `.pxm` document format
+## The `.pxl` document format
 
 A Zip archive, deliberately inspectable:
 
